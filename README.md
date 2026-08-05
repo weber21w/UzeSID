@@ -2,64 +2,84 @@
 
 Commodore 64 SID music player for Uzebox.
 
-UzeSID plays supported `.sid` music files using a lightweight 6502 and SID emulation system designed for the ATmega644. Raw SID files are pre-emulated into compact SID-register streams, which can then be cached for faster subsequent playback.
+UzeSID plays supported PSID music files using a lightweight 6502 and SID emulation system designed for the ATmega644. SID files are pre-emulated into compact, ordered streams of SID-register writes and then played by an optimized SID synthesizer.
 
-The player supports both an interpolated 7.86 kHz synthesis mode and an experimental native 15.72 kHz mode.
+Native 15.72 kHz synthesis is the default. An optional 7.86 kHz synthesis mode with interpolation is available for additional CPU margin.
 
 ## Overview
 
-UzeSID is a standalone PSID music player for the Uzebox platform.
-
-It can play music from:
+UzeSID can play music from:
 
 * `.SID` files stored in the root directory of an SD card
-* Pre-converted songs embedded in the `UZESID.UZE` database
+* Pre-converted songs embedded in the database appended to `UZESID.UZE`
 * Register streams previously generated and saved by the Uzebox
 
-When a raw SID file is selected for the first time, UzeSID pre-emulates the song and creates a compact register dump in expansion RAM. When database writing is enabled, the resulting stream is saved into the writable database appended to `UZESID.UZE`.
+When a loose SID file is selected for the first time, UzeSID runs its 6502 player code and captures the resulting SID-register writes into SPI RAM. The resulting stream is then saved into the writable database inside `UZESID.UZE`.
 
-On later playback, the cached register stream can be loaded directly without repeating the full SID emulation step.
+Later playback can load the cached register stream directly without repeating the pre-emulation step.
+
+The file browser merges loose SD-card SID files with songs embedded in the database. A database-only song therefore remains selectable even when its original `.SID` file is not present on the card.
 
 An SD card and Uzenet-compatible SPI expansion RAM are required.
 
 ## Features
 
-* Plays supported PSID music files
+* Plays supported PSID v1 and PSID v2 files
 * Supports multiple subtunes
 * Supports PAL and NTSC clock rates
 * Supports VBI-timed and CIA-timed songs
 * Detects high-frequency CIA playback rates
+* Preserves ordered SID writes, including repeated gate and test-bit transitions
 * Pre-emulates SID code into compact register streams
-* Supports cached register-stream playback
-* Includes a writable database appended to `UZESID.UZE`
-* Merges SD-card SID files and embedded database songs into one browser
-* Supports previous, next, pause, fast-forward, and subtune controls
-* Automatically detects the installed SPI RAM capacity
-* Supports 128 KiB through multi-megabyte SPI RAM configurations
-* Provides standard and native 15.72 kHz synthesis modes
-* Provides optional reduced-volume builds for additional audio headroom
+* Supports persistent cached-stream playback
+* Includes a writable LIDX/USDC database appended to `UZESID.UZE`
+* Merges loose SD-card files and database-only songs into one browser
+* Suppresses duplicate browser entries when the same SID exists in both places
+* Supports previous, restart, pause, play, fast-forward, next, and subtune controls
+* Supports SNES controllers and Super Mouse cursor movement
+* Automatically detects installed SPI RAM capacity
+* Supports 128 KiB and larger SPI RAM configurations
+* Uses native 15.72 kHz SID synthesis by default
+* Provides an optional 7.86 kHz interpolated build
 * Includes a desktop host converter for preparing embedded songs
+* Supports persistent runtime database updates without resizing the ROM file
 
-RSID playback is not currently advertised or guaranteed. RSID files generally expect a more complete Commodore 64 runtime environment than the lightweight pre-emulation system used by UzeSID.
+RSID operating-system behavior is not implemented. RSID files generally expect a more complete Commodore 64 environment than UzeSID provides.
 
 ## Emulation
 
 * [CUzeBox](https://github.com/Jubatian/cuzebox) supports Uzebox SPI expansion RAM.
 * [CUzeBoxESP8266](https://github.com/weber21w/cuzebox-8266) supports larger SPI RAM configurations.
 
-The available SPI RAM capacity affects the maximum size of raw SID files and generated register streams that can be loaded.
+The amount of emulated SPI RAM affects the largest SID-register stream that can be loaded.
 
 ## Requirements
 
 * Uzebox with Uzenet-compatible SPI expansion RAM
 
-  * 128 KiB minimum
-  * Larger RAM modules are recommended for long or complex songs
+  * 128 KiB is the minimum supported configuration
+  * Larger modules are recommended for long or register-heavy songs
 * SD card formatted as FAT16 or FAT32
 * Uzebox bootloader or ISP programmer
 * AVR-GCC toolchain
-* Python 3 for database-generation tools
-* A host C compiler for the desktop SID converter
+* Python 3
+* Host C compiler for the desktop SID converter
+* Sufficient SD-card space for the appended writable database
+
+### SPI RAM capacity
+
+The first 64 KiB SPI RAM bank is reserved for the emulated C64 memory space. An additional 2 KiB is reserved for browser and capture scratch data.
+
+On 128 KiB hardware, approximately 63,488 bytes remain for one generated or cached register stream. This is sufficient to run UzeSID and play smaller streams, but some long or high-rate songs require more RAM.
+
+The default database build targets 64 SPI RAM banks, or 4 MiB. To build an embedded database limited to 128 KiB hardware, use:
+
+```bash
+make clean-db
+make DB_SPI_BANKS=2
+```
+
+The database builder will reject embedded streams that do not fit the selected target capacity.
 
 ## Project Layout
 
@@ -76,8 +96,21 @@ uzebox-master/
         ├── Emulation.c
         ├── Emulation.h
         ├── soundMixerCustom.s
+        ├── gameinfo.properties
+        ├── data/
+        │   ├── tiles.inc
+        │   ├── tiles.png
+        │   └── tiles.xml
         ├── db-tool/
-        ├── host-converter/
+        │   ├── sids/
+        │   ├── host-converter/
+        │   │   ├── Makefile
+        │   │   ├── uzesid_capture.c
+        │   │   └── stubs/
+        │   ├── build_custom_database.py
+        │   ├── pack_uze_dependency.py
+        │   ├── validate_database.py
+        │   └── Songlengths.md5
         └── default/
             └── Makefile
 ```
@@ -90,144 +123,249 @@ Navigate to the build directory:
 cd uzebox-master/demos/UzeSID/default
 ```
 
-The build variants all generate the same output filenames. Copy or rename `UzeSID.uze` after each build when retaining more than one version.
-
-### Standard build
+### Default native 15.72 kHz build
 
 ```bash
 make
 ```
 
-The standard build generates SID samples internally at approximately 7.86 kHz and interpolates them to the approximately 15.72 kHz Uzebox audio output rate.
+Plain `make` builds the release configuration:
 
-This mode uses less CPU time than native synthesis and is the recommended compatibility build.
+* Native 15.72 kHz SID synthesis
+* Persistent database reads and writes
+* Raw-SID pre-emulation and capture
+* Eight-line adaptive rendering window
+* Normal output level
 
-### Quiet standard build
+The native synthesizer calculates every DAC sample directly. It includes optimized pitch conversion, noise generation, oscillator synchronization, envelope processing, SPI read-ahead, and register-stream decoding.
 
-```bash
-make quiet
-```
-
-This uses the standard 7.86 kHz synthesis and interpolation path, but shifts each SID voice sample right by one bit before mixing.
-
-The result is approximately 6 dB quieter and provides additional output headroom.
-
-### Native 15.72 kHz build
+The explicit native target is also available:
 
 ```bash
 make native15
 ```
 
-This calculates every output sample directly at approximately 15.72 kHz instead of generating alternating samples through interpolation.
-
-Native synthesis may improve:
-
-* High-frequency waveform detail
-* Noise reproduction
-* Oscillator synchronization
-* Ring modulation
-* Fast SID register effects
-
-It also consumes substantially more CPU time than the standard build.
-
-### Quiet native 15.72 kHz build
+### Optional 7.86 kHz interpolated build
 
 ```bash
-make native15-quiet
+make interp8
 ```
 
-This combines native 15.72 kHz synthesis with the one-bit per-voice attenuation used by the quiet standard build.
+This calculates the SID core at approximately 7.86 kHz and linearly interpolates the intermediate samples to the 15.72 kHz Uzebox output rate.
 
-Use this target to test native synthesis with approximately 6 dB of additional mixer headroom.
+The interpolated build uses less CPU time but retains:
+
+* The same database format
+* The same cached streams
+* Raw-SID capture
+* Persistent database writing
+* The same controls and browser behavior
+
+Cached streams are interchangeable between native and interpolated builds.
 
 ### Build comparison
 
-| Command               | SID synthesis | Interpolation | Approximate level |
-| --------------------- | ------------: | ------------: | ----------------: |
-| `make`                |      7.86 kHz |           Yes |            Normal |
-| `make quiet`          |      7.86 kHz |           Yes |             −6 dB |
-| `make native15`       |     15.72 kHz |            No |            Normal |
-| `make native15-quiet` |     15.72 kHz |            No |             −6 dB |
+| Command         | SID synthesis | Interpolation | Intended use            |
+| --------------- | ------------: | ------------: | ----------------------- |
+| `make`          |     15.72 kHz |            No | Default release build   |
+| `make native15` |     15.72 kHz |            No | Explicit native rebuild |
+| `make interp8`  |      7.86 kHz |           Yes | Additional CPU margin   |
 
-Each target performs the appropriate configuration rebuild.
+Build-configuration stamps prevent objects from one synthesis mode from being reused by another.
 
-A manual clean build can also be performed with:
+## Native Rendering Window
+
+Native synthesis temporarily reduces active rendering while the next audio buffer is generated. The normal 24-line interface is restored before input and GUI processing, so controls and cursor movement still update every frame.
+
+The default native rendering window is eight scanlines:
 
 ```bash
-make clean
 make
 ```
 
-To rebuild the embedded SID database from scratch:
+It can be adjusted at build time:
+
+```bash
+make UZESID_NATIVE_RENDER_LINES=12
+```
+
+Accepted values are 1 through 24:
+
+* Lower values reserve more CPU time for audio synthesis.
+* Higher values render more of the display during audio processing.
+* A value of 24 disables the temporary rendering reduction.
+
+The default value of 8 has been tested with demanding SID playback while maintaining full-speed native synthesis and smooth GUI updates.
+
+See `NATIVE_15KHZ.md` for additional implementation details.
+
+## Clean Builds
+
+Remove generated AVR build files:
+
+```bash
+make clean
+```
+
+Then rebuild the default native version:
+
+```bash
+make
+```
+
+`make clean` does not delete the generated writable database.
+
+To force the embedded database to be regenerated:
 
 ```bash
 make clean-db
 make
 ```
 
-A successful database-enabled build should report that the appended database was verified at its configured ROM offset.
+Useful maintenance targets include:
+
+```bash
+make host-converter
+make validate-db
+make custom-db-help
+```
 
 ## Build Output
 
-The build produces:
+The build produces files including:
 
 ```text
-UzeSID.hex
-UzeSID.uze
 UzeSID.elf
+UzeSID.hex
+UzeSID.eep
+UzeSID.lss
 UzeSID.map
+UzeSID.uze
 ```
 
 Use `UzeSID.hex` when flashing directly with an ISP programmer.
 
-For normal use, copy `UzeSID.uze` to the SD card and launch it through the Uzebox bootloader.
+For normal use, copy the complete generated `UzeSID.uze` file to the SD card as:
 
-The writable database is appended directly to `UzeSID.uze`, so the complete generated file must be copied to the SD card. Do not replace it with only the raw program image.
+```text
+UZESID.UZE
+```
+
+UzeSID opens `UZESID.UZE` at runtime when reading or updating its appended database.
+
+Do not copy only the raw program image. The complete `.uze` file contains both the executable program and the appended writable database.
+
+## Embedded Writable Database
+
+The build generates a fixed-size LIDX/USDC database and appends it after the packed 60 KiB program area.
+
+The database contains:
+
+* Song lengths indexed by complete-file MD5
+* Embedded register streams
+* Subtune metadata
+* Directory entries
+* Allocation bitmap
+* Preallocated writable free space
+
+The database begins at byte 61,952 in the generated `.uze` file. The packaging tool verifies the `LIDX` header at that location before the build succeeds.
+
+A successful build prints a line similar to:
+
+```text
+Packed database: ... verified LIDX at offset 61952 ...
+```
+
+Packaging errors stop the build instead of silently producing a ROM without its embedded streams.
+
+`UZESID.UZE` must remain writable on the SD card. Runtime cache updates modify preallocated sectors inside the file; the ROM is never resized.
+
+Replacing `UZESID.UZE` also replaces any streams that the hardware previously learned and saved.
 
 ## Adding Embedded SID Files
 
-Place SID files intended for pre-conversion in the configured source directory under:
+Place SID files intended for distribution in:
 
 ```text
-UzeSID/db-tool/
+UzeSID/db-tool/sids/
 ```
 
-The database builder uses the host converter to:
+The normal build automatically:
 
-1. Parse each SID file.
-2. Detect its playback timing.
-3. Pre-emulate each supported subtune.
-4. Generate compact SID-register streams.
-5. Build the writable database image.
-6. Append the database to `UzeSID.uze`.
+1. Scans `db-tool/sids/`.
+2. Parses each PSID file.
+3. Determines its subtune count and playback timing.
+4. Looks up or assigns each subtune’s duration.
+5. Runs the desktop host converter.
+6. Captures ordered SID-register writes.
+7. Compacts the captured stream.
+8. Builds the LIDX/USDC database.
+9. Regenerates `prebuilt_sids.inc`.
+10. Appends and verifies the database in `UzeSID.uze`.
 
-Embedded songs appear in the same browser as `.SID` files located on the SD-card root.
+Embedded songs appear in the merged browser even when their original `.SID` files are absent from the SD-card root.
 
-A song does not need to remain as a separate `.SID` file on the card when all required subtunes are present in the embedded database.
+The generated database defaults to:
+
+* 128 MiB writable tail
+* 512 directory entries
+* 64 SPI RAM banks as the playback target
+* Up to eight parallel converter jobs, depending on the host CPU
+
+Examples:
+
+```bash
+make clean-db
+make DB_TAIL_SIZE=64M
+```
+
+```bash
+make clean-db
+make DB_TAIL_SIZE=256M DB_DIR_ENTRIES=1024 DB_JOBS=8
+```
+
+For details about song-length overrides, automatic sizing, manifests, target SPI capacity, and standalone database generation, see:
+
+```text
+db-tool/CUSTOM_DATABASES.md
+```
+
+## Song Lengths
+
+The database builder uses MD5-based song-length data in this order:
+
+1. `Songlengths.override.md5`
+2. `Songlengths.md5`
+3. `Songlengths.local.md5`
+4. Configured default duration
+
+The normal default duration is three minutes when no matching length is available.
+
+`Songlengths.local.md5` is intended for songs absent from the main database. `Songlengths.override.md5` is intended for deliberate corrections to existing entries.
 
 ## Host Converter
 
 The desktop converter is located at:
 
 ```text
-UzeSID/host-converter/
+UzeSID/db-tool/host-converter/
 ```
 
-It compiles the SID pre-emulation system for the host computer and is used while building the embedded database.
+It compiles the same capture and emulation core used by the Uzebox build and converts PSID subtunes into ordered register streams on the development computer.
 
-The following directory must remain in the repository:
+The following directory is required and must remain in the repository:
 
 ```text
-UzeSID/host-converter/stubs/
+UzeSID/db-tool/host-converter/stubs/
 ```
 
-The stubs provide desktop-compatible replacements for AVR, Uzebox, Petit FatFs, and SPI RAM headers. This allows the converter to compile the same `UzeSID.c`, `Emulation.c`, and `Cache.c` source modules with a normal host compiler.
+The stubs provide host-compatible replacements for AVR, Uzebox, Petit FatFs, and SPI RAM declarations.
 
-Generated host executables and object files should not be committed, but the `stubs/` source directory is required.
+Generated host executables and object files should not be committed, but the source files and `stubs/` directory are required for reproducible database builds.
 
 ## SD-Card Layout
 
-A typical SD-card layout is:
+A typical SD-card root is:
 
 ```text
 /
@@ -240,7 +378,29 @@ A typical SD-card layout is:
 
 Only `UZESID.UZE` is required for songs already embedded in its database.
 
-Raw `.SID` files should be placed in the root directory of the card.
+Additional loose `.SID` files must be placed in the root directory. Subdirectory scanning is not currently supported by the Uzebox browser.
+
+## Controls
+
+* **START:** Open the merged loose-file and embedded-database browser
+* **SELECT:** Open the persistent cached-stream browser
+* **D-pad:** Move the cursor
+* **Super Mouse movement:** Move the cursor
+* **Y:** Activate the control under the cursor
+* **Super Mouse left button:** Activate the control under the cursor
+
+The player bar provides controls for:
+
+* Previous
+* Restart
+* Pause
+* Play
+* Fast-forward
+* Next
+* File browsers
+* Volume
+* Color mask
+* Save preferences
 
 ## Supported SID Files
 
@@ -248,18 +408,33 @@ UzeSID is intended for PSID files that can run within its lightweight 6502 and S
 
 Compatibility can depend on:
 
-* The 6502 instructions used by the player
-* Whether the song uses VBI or CIA timing
-* The expected PAL or NTSC clock
-* Unsupported hardware dependencies
+* The CPU instructions used by the player
+* VBI or CIA timing
+* PAL or NTSC clock expectations
 * Unsupported illegal CPU instructions
-* The amount of available SPI RAM
-* The size and duration of the generated register stream
+* Dependencies on unimplemented C64 hardware
+* The selected subtune duration
+* Available SPI RAM
+* Generated register-stream size
+* The number of ordered SID writes produced in one replay tick
 
-Songs included in the embedded database are pre-converted during the build and do not require the original `.SID` file to remain on the SD card.
+RSID operating-system behavior is not supported.
+
+## Current Limits
+
+* Loose `.SID` scanning is limited to the SD-card root.
+* Browser names use fixed 32-byte records.
+* The merged browser supports up to 63 entries.
+* A 128 KiB SPI RAM module leaves approximately 63,488 bytes for one register stream.
+* SID synthesis is optimized for the ATmega644 rather than cycle-exact.
+* Some optional Uzebox kernel features are disabled to preserve flash, SRAM, and CPU time.
+* Runtime database writes cannot extend the `.uze` file.
+* The default generated database is large because writable capacity is preallocated.
 
 ## Notes
 
-UzeSID operates near the ATmega644 flash, SRAM, and CPU limits. Some optional Uzebox kernel features are disabled to preserve enough resources for SID playback, filesystem access, expansion RAM, caching, and the user interface.
+UzeSID operates close to the ATmega644 flash, SRAM, and CPU limits.
 
-The native 15.72 kHz build is experimental. The standard interpolated build remains the recommended compatibility option.
+Native 15.72 kHz synthesis is now the recommended and default build. The optimized native path has been tested with register-heavy, pitch-heavy, and noise-heavy music while maintaining full-speed playback and smooth interface updates.
+
+The 7.86 kHz interpolated build remains available when additional CPU margin is preferred.
