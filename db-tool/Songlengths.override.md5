@@ -1,0 +1,4 @@
+[Database]
+; Project-local corrections. Values here take precedence over Songlengths.md5.
+; Use this only when a measured loop/end differs from the official duration.
+; Format: whole-file-md5=mm:ss mm:ss ...

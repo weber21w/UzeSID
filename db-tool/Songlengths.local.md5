@@ -1,0 +1,3 @@
+[Database]
+; Project-local fallback durations. Checked only when Songlengths.md5 has no
+; value for that SID/subtune. Format: whole-file-md5=mm:ss mm:ss ...
