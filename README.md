@@ -6,6 +6,14 @@ UzeSID plays supported PSID music files using a lightweight 6502 and SID emulati
 
 Native 15.72 kHz synthesis is the default. An optional 7.86 kHz synthesis mode with interpolation is available for additional CPU margin.
 
+
+## Demo Video
+
+Thanks to [creator name] for testing UzeSID and recording this demonstration:
+
+[![Watch the UzeSID demo](https://img.youtube.com/vi/rDpJzCZ6fUg/0.jpg)](https://www.youtube.com/watch?v=rDpJzCZ6fUg)
+
+
 ## Overview
 
 UzeSID can play music from:
