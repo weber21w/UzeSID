@@ -66,25 +66,21 @@ extern BYTE rcv_spi(void);
 #define SID_DEFAULT_CLOCK_HZ   985248UL
 #endif
 /* The DAC always outputs 262 samples per 60 Hz frame (15.72 kHz).  The
- * default SID core synthesizes every other sample and reconstructs the missing
- * samples with a stateful 2x linear interpolator.  Set UZESID_SYNTH_DUP=1 for
- * an experimental native-15.72-kHz core; this roughly doubles oscillator work. */
+ * release core synthesizes every DAC sample natively.  Set UZESID_SYNTH_DUP=2
+ * for the optional 7.86 kHz core with stateful 2x linear interpolation. */
 #ifndef UZESID_SYNTH_DUP
 #define UZESID_SYNTH_DUP       2u
 #endif
 #if (UZESID_SYNTH_DUP != 1u) && (UZESID_SYNTH_DUP != 2u)
 #error UZESID_SYNTH_DUP must be 1 or 2
 #endif
-/* Optional per-voice attenuation before the three voices are summed.  A value
- * of 1 is an inexpensive 6 dB A/B test: one arithmetic shift per voice sample,
- * with no general-purpose mixer or extra state. */
-#ifndef UZESID_MIX_SHIFT
-#define UZESID_MIX_SHIFT       0u
-#endif
-#if (UZESID_MIX_SHIFT > 1u)
-#error UZESID_MIX_SHIFT must be 0 or 1
-#endif
 #define UZESID_SYNTH_SPF       (UZE_SAMPLES_PER_FRAME / UZESID_SYNTH_DUP)
+#ifndef UZESID_NATIVE_RENDER_LINES
+#define UZESID_NATIVE_RENDER_LINES 8u
+#endif
+#if (UZESID_NATIVE_RENDER_LINES < 1u) || (UZESID_NATIVE_RENDER_LINES > 24u)
+#error UZESID_NATIVE_RENDER_LINES must be between 1 and 24
+#endif
 #define EMU_RATE_HZ            (UZESID_SYNTH_SPF * UZE_VIDEO_HZ)
 /* ADSR changes far more slowly than oscillator phase.  Updating it at about
  * 491 Hz removes almost all envelope-state work while oscillator phase,
@@ -138,7 +134,9 @@ void SIDExecute(void);
 void SIDSetReplayFreq(int freq);
 void SIDSetClockHz(u32 clock_hz);
 void SIDAdjustSpeed(int percent);
-void SIDWriteRegister(int reg, u8 val);
+void SIDWriteRegister(u8 reg, u8 val);
+void SIDBeginRegisterBatch(void);
+void SIDEndRegisterBatch(void);
 void UzeSID_CopyRegs(u8 *dst, u8 count);
 
 void cia_tl_write(u8 byte);

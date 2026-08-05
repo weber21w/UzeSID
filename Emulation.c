@@ -4,8 +4,8 @@
 #endif
 
 extern u8 rcv_spi(void);
-extern void UzeSidLoadProgress(u8 stage);
-extern void UzeSidCaptureProgress(u32 captured_ticks, u32 total_ticks);
+extern void LoadProgress(u8 stage);
+extern void CaptureProgress(u32 captured_ticks, u32 total_ticks);
 extern void SIDSetClockHz(u32 clock_hz);
 #include <string.h>
 #include <avr/pgmspace.h>
@@ -68,8 +68,7 @@ u32 g_uzesid_speed_flags;
 static inline u16 read_psid_16(const u8 *p, int ofs){ return (u16)(((u16)p[ofs] << 8) | p[ofs+1]); }
 static inline u32 read_psid_32(const u8 *p, int ofs){ return ((u32)p[ofs] << 24) | ((u32)p[ofs+1] << 16) | ((u32)p[ofs+2] << 8) | (u32)p[ofs+3]; }
 
-void UzesidCaptureNoteWrite(u8 reg, u8 val)
-{
+void UzesidCaptureNoteWrite(u8 reg, u8 val){
 #if UZESID_ENABLE_CAPTURE
 	u16 pos;
 	if(!g_uzesid_capture_enabled || reg >= UZESID_UZSD_INIT_REG_COUNT)
@@ -125,35 +124,29 @@ static u8 cache_last_slot;
  * A page is physically initialized only when the emulated CPU first writes it. */
 static u8 cpu_page_materialized[32];
 
-static inline u8 cpu_page_is_materialized(u8 page)
-{
+static inline u8 cpu_page_is_materialized(u8 page){
 	return (u8)(cpu_page_materialized[page >> 3] & (u8)(1u << (page & 7u)));
 }
 
-static inline void cpu_page_mark_materialized(u8 page)
-{
+static inline void cpu_page_mark_materialized(u8 page){
 	cpu_page_materialized[page >> 3] |= (u8)(1u << (page & 7u));
 }
 
-static inline u8 cpu_default_page_value(u8 page)
-{
+static inline u8 cpu_default_page_value(u8 page){
 	return (page >= 0xE0u) ? 0x40u : 0x00u;
 }
 
-static void cpu_spiram_block_read(u16 block, u8 *dst)
-{
+static void cpu_spiram_block_read(u16 block, u8 *dst){
 	u16 addr = (u16)(block << CPU_CACHE_BLOCK_SHIFT);
 	SpiRamReadInto(0, addr, dst, CPU_CACHE_BLOCK_SIZE);
 }
 
-static void cpu_spiram_block_write(u16 block, const u8 *src)
-{
+static void cpu_spiram_block_write(u16 block, const u8 *src){
 	u16 addr = (u16)(block << CPU_CACHE_BLOCK_SHIFT);
 	SpiRamWriteFrom(0, addr, (void *)src, CPU_CACHE_BLOCK_SIZE);
 }
 
-static void cpu_cache_flush_slot(u8 slot)
-{
+static void cpu_cache_flush_slot(u8 slot){
 	u16 bit = (u16)1u << slot;
 	if((cache_valid_mask & bit) && (cache_dirty_mask & bit)){
 		cpu_spiram_block_write(cache_tag[slot], cache_data[slot]);
@@ -161,8 +154,7 @@ static void cpu_cache_flush_slot(u8 slot)
 	}
 }
 
-static void cpu_materialize_page(u8 page, u8 *scratch)
-{
+static void cpu_materialize_page(u8 page, u8 *scratch){
 	u8 i;
 	u8 value = cpu_default_page_value(page);
 	u16 first_block = (u16)page << (8u - CPU_CACHE_BLOCK_SHIFT);
@@ -172,16 +164,14 @@ static void cpu_materialize_page(u8 page, u8 *scratch)
 	cpu_page_mark_materialized(page);
 }
 
-static void cpu_cache_reset(void)
-{
+static void cpu_cache_reset(void){
 	cache_valid_mask = 0;
 	cache_dirty_mask = 0;
 	cache_victim_bits = 0;
 	cache_last_slot = 0;
 }
 
-static u8 *cpu_cache_get_block(u16 adr, u8 for_write)
-{
+static u8 *cpu_cache_get_block(u16 adr, u8 for_write){
 	u16 block = adr >> CPU_CACHE_BLOCK_SHIFT;
 	u8 slot = cache_last_slot;
 	u16 bit = (u16)1u << slot;
@@ -242,38 +232,33 @@ static u8 *cpu_cache_get_block(u16 adr, u8 for_write)
 	return cache_data[slot];
 }
 
-u8 CPUPeekByte(u16 adr)
-{
+u8 CPUPeekByte(u16 adr){
 	u8 page = (u8)(adr >> 8);
 	if(page == CPU_SRAM_PAGE_ZP) return zp_ram[(u8)adr];
 	if(page == CPU_SRAM_PAGE_STACK) return st_ram[(u8)adr];
 	return cpu_cache_get_block(adr, 0)[(u8)(adr & (CPU_CACHE_BLOCK_SIZE - 1u))];
 }
 
-void CPUPokeByte(u16 adr, u8 byte)
-{
+void CPUPokeByte(u16 adr, u8 byte){
 	u8 page = (u8)(adr >> 8);
 	if(page == CPU_SRAM_PAGE_ZP){ zp_ram[(u8)adr] = byte; return; }
 	if(page == CPU_SRAM_PAGE_STACK){ st_ram[(u8)adr] = byte; return; }
 	cpu_cache_get_block(adr, 1)[(u8)(adr & (CPU_CACHE_BLOCK_SIZE - 1u))] = byte;
 }
 
-void CPUPokeBlock(u16 adr, const u8 *src, u16 len)
-{
+void CPUPokeBlock(u16 adr, const u8 *src, u16 len){
 	while(len--)
 		CPUPokeByte(adr++, *src++);
 }
 
-static void emu_mem_zero(u8 *dst, u16 len)
-{
+static void emu_mem_zero(u8 *dst, u16 len){
 	while(len--)
 		*dst++ = 0;
 }
 
 void MemoryInit() { cpu_cache_reset(); MemoryClear(); }
 void MemoryExit() { u8 i; for(i = 0; i < CPU_CACHE_BLOCKS; i++) cpu_cache_flush_slot(i); }
-void MemoryClear()
-{
+void MemoryClear(){
 	emu_mem_zero(zp_ram, sizeof(zp_ram));
 	emu_mem_zero(st_ram, sizeof(st_ram));
 	emu_mem_zero(cpu_page_materialized, sizeof(cpu_page_materialized));
@@ -292,8 +277,7 @@ void MemoryClear()
 #define CPUEMU_PFLAG_Z 0x02
 #define CPUEMU_PFLAG_C 0x01
 
-static __attribute__((noinline)) void cpu_do_adc_op(u8 *ra, u8 byte, u8 *n_flag, u8 *z_flag, u8 *pflags)
-{
+static __attribute__((noinline)) void cpu_do_adc_op(u8 *ra, u8 byte, u8 *n_flag, u8 *z_flag, u8 *pflags){
 	u8 a = *ra;
 	u8 p = *pflags;
 	if (p & CPUEMU_PFLAG_D) {
@@ -319,8 +303,7 @@ static __attribute__((noinline)) void cpu_do_adc_op(u8 *ra, u8 byte, u8 *n_flag,
 	*pflags = p;
 }
 
-static __attribute__((noinline)) void cpu_do_sbc_op(u8 *ra, u8 byte, u8 *n_flag, u8 *z_flag, u8 *pflags)
-{
+static __attribute__((noinline)) void cpu_do_sbc_op(u8 *ra, u8 byte, u8 *n_flag, u8 *z_flag, u8 *pflags){
 	u8 a = *ra;
 	u8 p = *pflags;
 	u16 tmp = (u16)a - (u16)byte - ((p & CPUEMU_PFLAG_C) ? 0u : 1u);
@@ -356,8 +339,7 @@ static void cia_write(u16 adr, u8 byte);
 /*
  *  Init CPU emulation
  */
-void CPUInit()
-{
+void CPUInit(){
 }
 
 
@@ -366,8 +348,7 @@ void CPUInit()
  *  Exit CPU emulation
  */
 
-void CPUExit()
-{
+void CPUExit(){
 }
 
 
@@ -375,18 +356,15 @@ void CPUExit()
  *  Memory access functions
  */
 
-static inline u8 ram_read(u16 adr)
-{
+static inline u8 ram_read(u16 adr){
 	return CPUPeekByte(adr);
 }
 
-static inline void ram_write(u16 adr, u8 byte)
-{
+static inline void ram_write(u16 adr, u8 byte){
 	CPUPokeByte(adr, byte);
 }
 
-static inline void cia_write(u16 adr, u8 byte)
-{
+static inline void cia_write(u16 adr, u8 byte){
 	if(adr == 0xdc04u)
 		cia_tl_write(byte);
 	else if(adr == 0xdc05u)
@@ -395,15 +373,13 @@ static inline void cia_write(u16 adr, u8 byte)
 		CPUPokeByte(adr, byte);
 }
 
-static inline u8 cpu_mem_read(u16 adr, cycle_t now)
-{
+static inline u8 cpu_mem_read(u16 adr, cycle_t now){
 	if((adr & 0xfc00u) == 0xd400u)
 		return (u8)sid_read(adr, now);
 	return ram_read(adr);
 }
 
-static inline void cpu_mem_write(u16 adr, u8 byte, cycle_t now, u8 rmw)
-{
+static inline void cpu_mem_write(u16 adr, u8 byte, cycle_t now, u8 rmw){
 	if((adr & 0xfc00u) == 0xd400u){
 		sid_write(adr, byte, now, rmw);
 		return;
@@ -419,8 +395,7 @@ static inline void cpu_mem_write(u16 adr, u8 byte, cycle_t now, u8 rmw)
  *  CPU emulation loop
  */
 
-void CPUExecute(u16 startadr, u8 init_ra, u8 init_rx, u8 init_ry, cycle_t max_cycles)
-{
+void CPUExecute(u16 startadr, u8 init_ra, u8 init_rx, u8 init_ry, cycle_t max_cycles){
     // 6510 registers
     u8 a = init_ra, x = init_rx, y = init_ry;
     u8 n_flag = 0, z_flag = 0;
@@ -2141,16 +2116,14 @@ illegal_op:        quit = 1;
     }
 }
 
-static int hex_nibble(char c)
-{
+static int hex_nibble(char c){
 	if(c >= '0' && c <= '9') return (int)(c - '0');
 	if(c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
 	if(c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
 	return -1;
 }
 
-int UzesidParseMd5Hex(const char *hex, u8 md5[16])
-{
+int UzesidParseMd5Hex(const char *hex, u8 md5[16]){
 	int i;
 	if(hex == 0 || md5 == 0) return -1;
 	for(i = 0; i < 16; i++)
@@ -2163,8 +2136,7 @@ int UzesidParseMd5Hex(const char *hex, u8 md5[16])
 	return (hex[32] == 0) ? 0 : -1;
 }
 
-void EmulationUpdatePlayAdr(void)
-{
+void EmulationUpdatePlayAdr(void){
 	if(g_uzesid_play_adr_from_irq_vec){
 		if(CPUPeekByte(0x0001) & 2)
 			play_adr = (u16)(((u16)CPUPeekByte(0x0315) << 8) | CPUPeekByte(0x0314));
@@ -2173,14 +2145,12 @@ void EmulationUpdatePlayAdr(void)
 	}
 }
 
-u8 IsPSIDLoaded(void)
-{
+u8 IsPSIDLoaded(void){
 	return g_uzesid_psid_loaded;
 }
 
 
-void SelectSong(u8 num)
-{
+void SelectSong(u8 num){
 	u8 vbi_hz;
 	if(number_of_songs <= 0)
 		return;
@@ -2205,6 +2175,9 @@ typedef struct {
 
 static inline u32 md5_rotl(u32 x, u32 s){ return (x << s) | (x >> (32u - s)); }
 
+/* AVR cannot address ordinary const tables in flash with normal loads.  Keep
+ * the 320-byte MD5 tables explicitly in PROGMEM; otherwise they consume scarce
+ * SRAM and leave too little stack for hashing plus the video interrupt. */
 static const u32 md5_k[64] PROGMEM = {
 	0xd76aa478u,0xe8c7b756u,0x242070dbu,0xc1bdceeeu,0xf57c0fafu,0x4787c62au,0xa8304613u,0xfd469501u,
 	0x698098d8u,0x8b44f7afu,0xffff5bb1u,0x895cd7beu,0x6b901122u,0xfd987193u,0xa679438eu,0x49b40821u,
@@ -2281,8 +2254,7 @@ static void md5_final(md5_ctx_t *ctx, u8 out[16]){
 #ifdef UZESID_HAVE_PFF
 /* The bundled LIDX is keyed by a whole-file SID MD5, so keep this distinct
  * from the traditional HVSC tune fingerprint algorithm. */
-UZESID_NOINLINE static u8 compute_file_md5_pff(const char *path, u8 out[16])
-{
+UZESID_NOINLINE static u8 compute_file_md5_pff(const char *path, u8 out[16]){
 	FRESULT res;
 	md5_ctx_t md5;
 	UINT br;
@@ -2303,8 +2275,7 @@ UZESID_NOINLINE static u8 compute_file_md5_pff(const char *path, u8 out[16])
 /* The PSID header and the current USDC entry intentionally share the same
  * 124-byte scratch object. Copy each field backward and in descending source
  * order so the overlapping moves cannot destroy a later source. */
-static void psid_copy_text_overlap(char *dst, const u8 *src, u8 count)
-{
+static void psid_copy_text_overlap(char *dst, const u8 *src, u8 count){
 	while(count != 0u){
 		count--;
 		dst[count] = (char)src[count];
@@ -2313,8 +2284,7 @@ static void psid_copy_text_overlap(char *dst, const u8 *src, u8 count)
 
 #define PSID_PAYLOAD_CHUNK 32u
 
-UZESID_NOINLINE u8 LoadPSIDFilePff(const char *file, u8 md5_out[16], UzesidUsdcEntry *scratch_entry, s16 requested_song)
-{
+UZESID_NOINLINE u8 LoadPSIDFilePff(const char *file, u8 md5_out[16], UzesidUsdcEntry *scratch_entry, s16 requested_song){
 	FRESULT res;
 	UINT br;
 	u8 *header;
@@ -2397,22 +2367,20 @@ UZESID_NOINLINE u8 LoadPSIDFilePff(const char *file, u8 md5_out[16], UzesidUsdcE
 		else if(clock_id == 2u)
 			SIDSetClockHz(1022727UL);
 	}
-	{
-		UzesidUsdcEntry *meta = scratch_entry;
-		/* Descending field order is required because source and destination
-		 * ranges overlap inside the shared 124-byte scratch object. */
-		psid_copy_text_overlap(meta->released, header + PSID_COPYRIGHT, (u8)(sizeof(meta->released) - 1u));
-		meta->released[sizeof(meta->released) - 1u] = 0;
-		psid_copy_text_overlap(meta->author, header + PSID_AUTHOR, (u8)(sizeof(meta->author) - 1u));
-		meta->author[sizeof(meta->author) - 1u] = 0;
-		psid_copy_text_overlap(meta->title, header + PSID_NAME, (u8)(sizeof(meta->title) - 1u));
-		meta->title[sizeof(meta->title) - 1u] = 0;
-	}
+	UzesidUsdcEntry *meta = scratch_entry;
+	/* Descending field order is required because source and destination
+	 * ranges overlap inside the shared 124-byte scratch object. */
+	psid_copy_text_overlap(meta->released, header + PSID_COPYRIGHT, (u8)(sizeof(meta->released) - 1u));
+	meta->released[sizeof(meta->released) - 1u] = 0;
+	psid_copy_text_overlap(meta->author, header + PSID_AUTHOR, (u8)(sizeof(meta->author) - 1u));
+	meta->author[sizeof(meta->author) - 1u] = 0;
+	psid_copy_text_overlap(meta->title, header + PSID_NAME, (u8)(sizeof(meta->title) - 1u));
+	meta->title[sizeof(meta->title) - 1u] = 0;
 	if(g_uzesid_init_adr == 0) g_uzesid_init_adr = load_adr;
 	if(requested_song >= 0 && requested_song < number_of_songs)
 		current_song = requested_song;
 
-	UzeSidLoadProgress(1);
+	LoadProgress(1);
 	MemoryClear();
 	ofs = load_adr;
 	while(payload_size != 0){
@@ -2427,10 +2395,10 @@ UZESID_NOINLINE u8 LoadPSIDFilePff(const char *file, u8 md5_out[16], UzesidUsdcE
 		payload_size -= want;
 	}
 	if(md5_out != 0){
-		UzeSidLoadProgress(2);
+		LoadProgress(2);
 		if(!compute_file_md5_pff(file, md5_out)) memset(md5_out, 0, 16);
 	}
-	UzeSidLoadProgress(3);
+	LoadProgress(3);
 	SIDReset(0);
 	SelectSong((u8)current_song);
 	g_uzesid_psid_loaded = 1;
@@ -2441,8 +2409,7 @@ UZESID_NOINLINE u8 LoadPSIDFilePff(const char *file, u8 md5_out[16], UzesidUsdcE
 UZESID_NOINLINE u8 LoadPSIDFilePff(const char *file, u8 md5_out[16], UzesidUsdcEntry *scratch_entry, s16 requested_song) { (void)file; (void)scratch_entry; (void)requested_song; if(md5_out) memset(md5_out,0,16); return 0; }
 #endif
 
-static u16 replay_freq_hz(void)
-{
+static u16 replay_freq_hz(void){
 	u8 speed_bit = (current_song < 32) ? (u8)current_song : 31u;
 	u32 div;
 	u32 f;
@@ -2461,14 +2428,12 @@ static u16 replay_freq_hz(void)
 	return (u16)f;
 }
 
-static void emu_ofs_to_bank_addr(u32 ofs, u8 *bank, u16 *addr)
-{
+static void emu_ofs_to_bank_addr(u32 ofs, u8 *bank, u16 *addr){
 	*bank = (u8)(ofs >> 16);
 	*addr = (u16)(ofs & 0xffffu);
 }
 
-static u8 temp_write(u32 ofs, const void *src_, u16 len)
-{
+static u8 temp_write(u32 ofs, const void *src_, u16 len){
 	const u8 *src = (const u8*)src_;
 	while(len){
 		u8 bank;
@@ -2486,16 +2451,14 @@ static u8 temp_write(u32 ofs, const void *src_, u16 len)
 }
 
 
-static u8 emit_bytes(u32 *write_ofs, u32 temp_end, const void *src, u16 len)
-{
+static u8 emit_bytes(u32 *write_ofs, u32 temp_end, const void *src, u16 len){
 	if(*write_ofs + len > temp_end) return 0;
 	temp_write(*write_ofs, src, len);
 	*write_ofs += len;
 	return 1;
 }
 
-static u8 emit_uleb128(u32 *write_ofs, u32 temp_end, u32 value)
-{
+static u8 emit_uleb128(u32 *write_ofs, u32 temp_end, u32 value){
 	u8 b;
 	do{
 		b = (u8)(value & 0x7fu);
@@ -2506,33 +2469,27 @@ static u8 emit_uleb128(u32 *write_ofs, u32 temp_end, u32 value)
 	return 1;
 }
 
-static u8 emit_tick_skip_run(u32 *write_ofs, u32 temp_end, u32 run)
-{
+static u8 emit_tick_skip_run(u32 *write_ofs, u32 temp_end, u32 run){
 	u8 op = UZESID_UZSD_OP_SKIP;
 	if(run == 0u) return 1;
 	if(!emit_bytes(write_ofs, temp_end, &op, 1)) return 0;
 	return emit_uleb128(write_ofs, temp_end, run);
 }
 
-static u8 emit_tick_interleaved(u32 *write_ofs, u32 temp_end, const u8 *events, u16 count)
-{
+static u8 emit_tick_interleaved(u32 *write_ofs, u32 temp_end, const u8 *events, u16 count){
 	u8 op = UZESID_UZSD_OP_PAIRS;
 	if(!emit_bytes(write_ofs, temp_end, &op, 1)) return 0;
-	{
-		u8 count8 = (u8)count;
-		if(!emit_bytes(write_ofs, temp_end, &count8, 1)) return 0;
-	}
+	u8 count8 = (u8)count;
+	if(!emit_bytes(write_ofs, temp_end, &count8, 1)) return 0;
 	return emit_bytes(write_ofs, temp_end, events, count * 2u);
 }
 
-static u8 emit_stream_end(u32 *write_ofs, u32 temp_end)
-{
+static u8 emit_stream_end(u32 *write_ofs, u32 temp_end){
 	u8 op = UZESID_UZSD_OP_END;
 	return emit_bytes(write_ofs, temp_end, &op, 1);
 }
 
-static u8 uleb128_size(u32 value)
-{
+static u8 uleb128_size(u32 value){
 	u8 n = 1;
 	while(value >= 0x80u){
 		value >>= 7;
@@ -2541,16 +2498,14 @@ static u8 uleb128_size(u32 value)
 	return n;
 }
 
-static void capture_wr32(u8 *p, u32 value)
-{
+static void capture_wr32(u8 *p, u32 value){
 	p[0] = (u8)value;
 	p[1] = (u8)(value >> 8);
 	p[2] = (u8)(value >> 16);
 	p[3] = (u8)(value >> 24);
 }
 
-UZESID_NOINLINE u8 UzesidCaptureCurrentSongToSpi(u32 temp_ofs, u32 temp_capacity, u32 song_length_ms, u32 *out_total_size, u32 *out_song_length_ms, u16 *out_tick_hz)
-{
+UZESID_NOINLINE u8 UzesidCaptureCurrentSongToSpi(u32 temp_ofs, u32 temp_capacity, u32 song_length_ms, u32 *out_total_size, u32 *out_song_length_ms, u16 *out_tick_hz){
 	u8 *header = g_uzesid_capture_header;
 	u8 *prev_regs = g_uzesid_capture_prev;
 	u32 header_ofs = temp_ofs;
@@ -2582,7 +2537,7 @@ UZESID_NOINLINE u8 UzesidCaptureCurrentSongToSpi(u32 temp_ofs, u32 temp_capacity
 	if(total_ticks == 0u) total_ticks = 1u;
 	capture_wr32(header + 16, total_ticks);
 	if(!temp_write(header_ofs, header, UZESID_UZSD_HEADER_SIZE)) return 0;
-	UzeSidCaptureProgress(0, total_ticks);
+	CaptureProgress(0, total_ticks);
 
 	while(attempted_ticks < total_ticks){
 		u16 event_count;
@@ -2629,7 +2584,7 @@ UZESID_NOINLINE u8 UzesidCaptureCurrentSongToSpi(u32 temp_ofs, u32 temp_capacity
 		}
 
 		if((attempted_ticks & 255u) == 0u)
-			UzeSidCaptureProgress(attempted_ticks, total_ticks);
+			CaptureProgress(attempted_ticks, total_ticks);
 	}
 
 	if(pending_empty_ticks){
@@ -2648,19 +2603,17 @@ UZESID_NOINLINE u8 UzesidCaptureCurrentSongToSpi(u32 temp_ofs, u32 temp_capacity
 		truncated = 1;
 	/* The header buffer doubles as the per-tick compact register scratch.
 	 * Reload the serialized original before updating its final counters. */
-	{
-		u8 bank;
-		u16 addr;
-		emu_ofs_to_bank_addr(header_ofs, &bank, &addr);
-		SpiRamReadInto(bank, addr, header, UZESID_UZSD_HEADER_SIZE);
-	}
+	u8 bank;
+	u16 addr;
+	emu_ofs_to_bank_addr(header_ofs, &bank, &addr);
+	SpiRamReadInto(bank, addr, header, UZESID_UZSD_HEADER_SIZE);
 	if(truncated)
 		header[7] |= (u8)(UZESID_UZSD_FLAG_TRUNCATED | trunc_reason);
 	capture_wr32(header + 12, (u32)((committed_ticks * 1000u + ((u32)tick_hz / 2u)) / (u32)tick_hz));
 	capture_wr32(header + 16, committed_ticks);
 	capture_wr32(header + 20, write_ofs - (header_ofs + UZESID_UZSD_HEADER_SIZE));
 	temp_write(header_ofs, header, UZESID_UZSD_HEADER_SIZE);
-	UzeSidCaptureProgress(attempted_ticks, total_ticks);
+	CaptureProgress(attempted_ticks, total_ticks);
 	if(out_total_size) *out_total_size = write_ofs - header_ofs;
 	if(out_song_length_ms) *out_song_length_ms = UzesidRd32(header + 12);
 	if(out_tick_hz) *out_tick_hz = tick_hz;

@@ -241,6 +241,7 @@ int UzesidUzsdOpenFromReader(UzesidUzsdStream *st, const UzesidReader *io, u32 b
 int UzesidUzsdOpenFromSpi(UzesidUzsdStream *st, u32 base_offset, u32 total_size);
 int UzesidUzsdOpenFromEntry(UzesidUzsdStream *st, const UzesidUsdc *usdc, const UzesidUsdcEntry *entry);
 int UzesidUzsdRestart(UzesidUzsdStream *st);
+void UzesidUzsdIdlePrefetch(UzesidUzsdStream *st);
 #if !defined(UZESID_DIRECT_SID_ONLY) || !(UZESID_DIRECT_SID_ONLY)
 int UzesidUzsdNextTick(UzesidUzsdStream *st, UzesidUzsdTick *tick);
 #endif

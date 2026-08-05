@@ -15,7 +15,6 @@ extern u8 g_uzesid_workbuf[512];
 #define UZESID_STREAM_PREFETCH UZESID_RUNTIME_SCRATCH_SIZE
 #define g_uzsd_prefetch_buf g_uzesid_runtime_scratch
 static const UzesidUzsdStream *g_uzsd_prefetch_owner;
-static u32 g_uzsd_prefetch_base;
 static u8 g_uzsd_prefetch_valid;
 static u8 g_uzsd_prefetch_pos;
 
@@ -51,8 +50,7 @@ static const int8_t g_uzsd_v4_delta[UZESID_UZSD_INIT_REG_COUNT][7] PROGMEM = {
     {  48, -48,  32, -32,  -1,  16,  96 }
 };
 
-static inline int8_t uzsd_v4_get_delta(u8 reg, u8 code)
-{
+static inline int8_t uzsd_v4_get_delta(u8 reg, u8 code){
     return (int8_t)pgm_read_byte(&g_uzsd_v4_delta[reg][code]);
 }
 #ifdef UZESID_HAVE_PFF
@@ -61,23 +59,19 @@ static inline int8_t uzsd_v4_get_delta(u8 reg, u8 code)
 
 
 /* ---- from uzesid_io.c ---- */
-u16 UzesidRd16(const u8 *p)
-{
+u16 UzesidRd16(const u8 *p){
 	return (u16)p[0] | ((u16)p[1] << 8);
 }
 
-u32 UzesidRd24(const u8 *p)
-{
+u32 UzesidRd24(const u8 *p){
 	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16);
 }
 
-u32 UzesidRd32(const u8 *p)
-{
+u32 UzesidRd32(const u8 *p){
 	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
-int UzesidReadExact(const UzesidReader *io, u32 abs_offset, void *dst, u16 len)
-{
+int UzesidReadExact(const UzesidReader *io, u32 abs_offset, void *dst, u16 len){
 	if(io == 0 || io->read_at == 0)
 		return -1;
 	return io->read_at(io->user, abs_offset, dst, len) == 0 ? 0 : -1;
@@ -85,8 +79,7 @@ int UzesidReadExact(const UzesidReader *io, u32 abs_offset, void *dst, u16 len)
 
 /* ---- from uzesid_pff_io.c ---- */
 #ifdef UZESID_HAVE_PFF
-u8 UzesidPffReadAt(void *user, u32 abs_offset, void *dst, u16 len)
-{
+u8 UzesidPffReadAt(void *user, u32 abs_offset, void *dst, u16 len){
 	UINT br;
 	(void)user;
 	if(pf_lseek(abs_offset) != FR_OK)
@@ -99,22 +92,19 @@ u8 UzesidPffReadAt(void *user, u32 abs_offset, void *dst, u16 len)
 	return 0;
 }
 
-void UzesidPffInitReader(UzesidReader *io, UzesidPffContext *ctx)
-{
+void UzesidPffInitReader(UzesidReader *io, UzesidPffContext *ctx){
 	io->user = ctx;
 	io->read_at = UzesidPffReadAt;
 }
 #endif
 
 /* ---- SPI reader ---- */
-static void uzesid_ofs_to_bank_addr(u32 ofs, u8 *bank, u16 *addr)
-{
+static void uzesid_ofs_to_bank_addr(u32 ofs, u8 *bank, u16 *addr){
 	*bank = (u8)(ofs >> 16);
 	*addr = (u16)(ofs & 0xffffu);
 }
 
-u8 UzesidSpiReadAt(void *user, u32 abs_offset, void *dst, u16 len)
-{
+u8 UzesidSpiReadAt(void *user, u32 abs_offset, void *dst, u16 len){
 	u8 bank;
 	u16 addr;
 	(void)user;
@@ -138,16 +128,14 @@ u8 UzesidSpiReadAt(void *user, u32 abs_offset, void *dst, u16 len)
 	return 0;
 }
 
-void UzesidSpiInitReader(UzesidReader *io, UzesidSpiContext *ctx)
-{
+void UzesidSpiInitReader(UzesidReader *io, UzesidSpiContext *ctx){
 	(void)ctx;
 	io->user = 0;
 	io->read_at = UzesidSpiReadAt;
 }
 
 /* ---- from lidx_ro.c ---- */
-static void lidx_decode_header(UzesidLidxHeader *out, const u8 raw[64])
-{
+static void lidx_decode_header(UzesidLidxHeader *out, const u8 raw[64]){
 	memcpy(out->magic, raw + 0, 4);
 	out->version = raw[4];
 	out->bucket_bits = raw[5];
@@ -165,16 +153,14 @@ static void lidx_decode_header(UzesidLidxHeader *out, const u8 raw[64])
 	memcpy(out->reserved, raw + 48, 16);
 }
 
-static void lidx_decode_record(UzesidLidxRecord *out, const u8 raw[24])
-{
+static void lidx_decode_record(UzesidLidxRecord *out, const u8 raw[24]){
 	memcpy(out->md5, raw + 0, 16);
 	out->subtune_count = UzesidRd16(raw + 16);
 	out->flags = UzesidRd16(raw + 18);
 	out->data_or_length = UzesidRd32(raw + 20);
 }
 
-u8 UzesidLidxOpen(UzesidLidx *lidx, const UzesidReader *io, u32 base_offset)
-{
+u8 UzesidLidxOpen(UzesidLidx *lidx, const UzesidReader *io, u32 base_offset){
 	u8 raw[64];
 	u32 end_offset;
 
@@ -199,8 +185,7 @@ u8 UzesidLidxOpen(UzesidLidx *lidx, const UzesidReader *io, u32 base_offset)
 	return 0;
 }
 
-u16 UzesidLidxBucketFromMd5(const UzesidLidx *lidx, const u8 md5[16])
-{
+u16 UzesidLidxBucketFromMd5(const UzesidLidx *lidx, const u8 md5[16]){
 	u8 bits;
 	u16 bucket;
 
@@ -216,8 +201,7 @@ u16 UzesidLidxBucketFromMd5(const UzesidLidx *lidx, const u8 md5[16])
 	return bucket;
 }
 
-u8 UzesidLidxReadRecord(const UzesidLidx *lidx, u32 index, UzesidLidxRecord *rec)
-{
+u8 UzesidLidxReadRecord(const UzesidLidx *lidx, u32 index, UzesidLidxRecord *rec){
 	u8 raw[24];
 	u32 offset;
 
@@ -232,8 +216,7 @@ u8 UzesidLidxReadRecord(const UzesidLidx *lidx, u32 index, UzesidLidxRecord *rec
 	return 0;
 }
 
-static u8 lidx_read_bucket_bounds(const UzesidLidx *lidx, u16 bucket, u32 *start, u32 *end)
-{
+static u8 lidx_read_bucket_bounds(const UzesidLidx *lidx, u16 bucket, u32 *start, u32 *end){
 	u8 raw[8];
 	u32 offset;
 
@@ -249,8 +232,7 @@ static u8 lidx_read_bucket_bounds(const UzesidLidx *lidx, u16 bucket, u32 *start
 	return 0;
 }
 
-u8 UzesidLidxFindRecordIndex(const UzesidLidx *lidx, const u8 md5[16], u32 *index_out)
-{
+u8 UzesidLidxFindRecordIndex(const UzesidLidx *lidx, const u8 md5[16], u32 *index_out){
 	u16 bucket;
 	u32 lo;
 	u32 hi;
@@ -287,8 +269,7 @@ u8 UzesidLidxFindRecordIndex(const UzesidLidx *lidx, const u8 md5[16], u32 *inde
 	return 0;
 }
 
-u8 UzesidLidxGetLengthMs(const UzesidLidx *lidx, const u8 md5[16], u16 subtune_index, u32 *length_ms)
-{
+u8 UzesidLidxGetLengthMs(const UzesidLidx *lidx, const u8 md5[16], u16 subtune_index, u32 *length_ms){
 	UzesidLidxRecord rec;
 	u8 raw[3];
 	u32 index;
@@ -323,8 +304,7 @@ u8 UzesidLidxGetLengthMs(const UzesidLidx *lidx, const u8 md5[16], u16 subtune_i
 #endif
 #if UZESID_DB_WRITE
 
-static u32 usdc_crc32(const u8 *data, u16 len)
-{
+static u32 usdc_crc32(const u8 *data, u16 len){
 	u32 crc = 0xffffffffUL;
 	u16 i;
 	for(i = 0; i < len; i++){
@@ -340,8 +320,7 @@ static void wr16(u8 *p, u16 v){ p[0]=(u8)(v&0xffu); p[1]=(u8)(v>>8); }
 static void wr32(u8 *p, u32 v){ p[0]=(u8)(v&0xffu); p[1]=(u8)((v>>8)&0xffu); p[2]=(u8)((v>>16)&0xffu); p[3]=(u8)((v>>24)&0xffu); }
 #endif
 
-static void usdc_decode_header(UzesidUsdcHeader *out, const u8 raw[64])
-{
+static void usdc_decode_header(UzesidUsdcHeader *out, const u8 raw[64]){
 	memcpy(out->magic, raw + 0, 4);
 	out->version = raw[4];
 	out->block_shift = raw[5];
@@ -361,8 +340,7 @@ static void usdc_decode_header(UzesidUsdcHeader *out, const u8 raw[64])
 }
 
 #if UZESID_DB_WRITE
-static void usdc_encode_header(const UzesidUsdcHeader *in, u8 raw[64])
-{
+static void usdc_encode_header(const UzesidUsdcHeader *in, u8 raw[64]){
 	memset(raw, 0, 64);
 	memcpy(raw + 0, in->magic, 4);
 	raw[4] = in->version;
@@ -383,8 +361,7 @@ static void usdc_encode_header(const UzesidUsdcHeader *in, u8 raw[64])
 }
 #endif
 
-static void usdc_decode_entry(UzesidUsdcEntry *out, const u8 raw[128])
-{
+static void usdc_decode_entry(UzesidUsdcEntry *out, const u8 raw[128]){
 	memset(out, 0, sizeof(*out));
 	out->state = raw[0];
 	out->type = raw[1];
@@ -408,8 +385,7 @@ static void usdc_decode_entry(UzesidUsdcEntry *out, const u8 raw[128])
 }
 
 #if UZESID_DB_WRITE
-static void usdc_encode_entry(const UzesidUsdcEntry *in, u8 raw[128])
-{
+static void usdc_encode_entry(const UzesidUsdcEntry *in, u8 raw[128]){
 	memset(raw, 0, 128);
 	raw[0] = in->state;
 	raw[1] = in->type;
@@ -431,8 +407,7 @@ static void usdc_encode_entry(const UzesidUsdcEntry *in, u8 raw[128])
 #endif
 
 #if UZESID_DB_WRITE && UZESID_HAVE_PFF
-static UZESID_NOINLINE u8 usdc_write_exact(u32 abs_offset, const void *src, u16 len)
-{
+static UZESID_NOINLINE u8 usdc_write_exact(u32 abs_offset, const void *src, u16 len){
 	u8 *secbuf = g_uzesid_workbuf;
 	const u8 *sp = (const u8 *)src;
 	UINT br;
@@ -469,8 +444,7 @@ static UZESID_NOINLINE u8 usdc_write_exact(u32 abs_offset, const void *src, u16 
 	return 0;
 }
 #elif UZESID_DB_WRITE
-static u8 usdc_write_exact(u32 abs_offset, const void *src, u16 len)
-{
+static u8 usdc_write_exact(u32 abs_offset, const void *src, u16 len){
 	(void)abs_offset;
 	(void)src;
 	(void)len;
@@ -478,8 +452,7 @@ static u8 usdc_write_exact(u32 abs_offset, const void *src, u16 len)
 }
 #endif
 
-u8 UzesidUsdcOpen(UzesidUsdc *usdc, const UzesidReader *io, u32 base_offset)
-{
+u8 UzesidUsdcOpen(UzesidUsdc *usdc, const UzesidReader *io, u32 base_offset){
 	u8 raw[64];
 
 	if(usdc == 0 || io == 0)
@@ -504,8 +477,7 @@ u8 UzesidUsdcOpen(UzesidUsdc *usdc, const UzesidReader *io, u32 base_offset)
 	return 0;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcReadEntry(const UzesidUsdc *usdc, u32 index, UzesidUsdcEntry *entry)
-{
+UZESID_NOINLINE u8 UzesidUsdcReadEntry(const UzesidUsdc *usdc, u32 index, UzesidUsdcEntry *entry){
 	u8 raw[128];
 	u32 offset;
 
@@ -521,8 +493,7 @@ UZESID_NOINLINE u8 UzesidUsdcReadEntry(const UzesidUsdc *usdc, u32 index, Uzesid
 }
 
 static UZESID_NOINLINE u8 usdc_entry_key_matches(const UzesidUsdc *usdc, u32 index,
-	const u8 md5[16], u16 subtune_index, u8 *matches)
-{
+	const u8 md5[16], u16 subtune_index, u8 *matches){
 	u8 raw[32];
 	u32 offset;
 	if(usdc == 0 || md5 == 0 || matches == 0)
@@ -537,8 +508,7 @@ static UZESID_NOINLINE u8 usdc_entry_key_matches(const UzesidUsdc *usdc, u32 ind
 	return 0;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcFindEntryIndex(const UzesidUsdc *usdc, const u8 md5[16], u16 subtune_index, u32 *entry_index)
-{
+UZESID_NOINLINE u8 UzesidUsdcFindEntryIndex(const UzesidUsdc *usdc, const u8 md5[16], u16 subtune_index, u32 *entry_index){
 	u32 i;
 	u8 matches;
 	u8 rc;
@@ -557,8 +527,7 @@ UZESID_NOINLINE u8 UzesidUsdcFindEntryIndex(const UzesidUsdc *usdc, const u8 md5
 	return 5;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcFindEntry(const UzesidUsdc *usdc, const u8 md5[16], u16 subtune_index, UzesidUsdcEntry *entry, u32 *entry_index)
-{
+UZESID_NOINLINE u8 UzesidUsdcFindEntry(const UzesidUsdc *usdc, const u8 md5[16], u16 subtune_index, UzesidUsdcEntry *entry, u32 *entry_index){
 	u32 idx;
 	u8 rc;
 
@@ -575,8 +544,7 @@ UZESID_NOINLINE u8 UzesidUsdcFindEntry(const UzesidUsdc *usdc, const u8 md5[16],
 	return 0;
 }
 
-u8 UzesidUsdcReadData(const UzesidUsdc *usdc, u32 first_block, u32 offset_in_usd, void *dst, u16 len)
-{
+u8 UzesidUsdcReadData(const UzesidUsdc *usdc, u32 first_block, u32 offset_in_usd, void *dst, u16 len){
 	u32 abs_offset;
 
 	if(usdc == 0 || dst == 0)
@@ -588,8 +556,7 @@ u8 UzesidUsdcReadData(const UzesidUsdc *usdc, u32 first_block, u32 offset_in_usd
 }
 
 #if UZESID_DB_WRITE
-UZESID_NOINLINE u8 UzesidUsdcWriteHeader(UzesidUsdc *usdc)
-{
+UZESID_NOINLINE u8 UzesidUsdcWriteHeader(UzesidUsdc *usdc){
 	u8 raw[64];
 	if(usdc == 0)
 		return 1;
@@ -603,8 +570,7 @@ UZESID_NOINLINE u8 UzesidUsdcWriteHeader(UzesidUsdc *usdc)
 	return 0;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcWriteEntry(UzesidUsdc *usdc, u32 index, const UzesidUsdcEntry *entry)
-{
+UZESID_NOINLINE u8 UzesidUsdcWriteEntry(UzesidUsdc *usdc, u32 index, const UzesidUsdcEntry *entry){
 	u8 raw[128];
 	u32 offset;
 	u32 crc;
@@ -623,8 +589,7 @@ UZESID_NOINLINE u8 UzesidUsdcWriteEntry(UzesidUsdc *usdc, u32 index, const Uzesi
 	return 0;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcFindFreeEntry(UzesidUsdc *usdc, u32 *index_out)
-{
+UZESID_NOINLINE u8 UzesidUsdcFindFreeEntry(UzesidUsdc *usdc, u32 *index_out){
 	u32 i;
 	u32 offset;
 	u8 state;
@@ -643,8 +608,7 @@ UZESID_NOINLINE u8 UzesidUsdcFindFreeEntry(UzesidUsdc *usdc, u32 *index_out)
 }
 
 
-static u8 bitmap_set_range(UzesidUsdc *usdc, u32 first, u32 count)
-{
+static u8 bitmap_set_range(UzesidUsdc *usdc, u32 first, u32 count){
 	while(count != 0u){
 		u8 b;
 		u8 first_bit = (u8)(first & 7u);
@@ -664,8 +628,7 @@ static u8 bitmap_set_range(UzesidUsdc *usdc, u32 first, u32 count)
 }
 
 static UZESID_NOINLINE u8 bitmap_find_free_run(const UzesidUsdc *usdc,
-	u32 begin, u32 end, u32 needed, u32 *first_block_out)
-{
+	u32 begin, u32 end, u32 needed, u32 *first_block_out){
 	u32 pos = begin;
 	u32 run_start = 0;
 	u32 run_length = 0;
@@ -699,8 +662,7 @@ static UZESID_NOINLINE u8 bitmap_find_free_run(const UzesidUsdc *usdc,
 	return 9;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcFindFreeBlocks(const UzesidUsdc *usdc, u32 block_count, u32 *first_block_out)
-{
+UZESID_NOINLINE u8 UzesidUsdcFindFreeBlocks(const UzesidUsdc *usdc, u32 block_count, u32 *first_block_out){
 	u8 rc;
 	if(usdc == 0 || first_block_out == 0 || block_count == 0)
 		return 1;
@@ -722,8 +684,7 @@ UZESID_NOINLINE u8 UzesidUsdcFindFreeBlocks(const UzesidUsdc *usdc, u32 block_co
 	return 9;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcCommitBlocks(UzesidUsdc *usdc, u32 first_block, u32 block_count)
-{
+UZESID_NOINLINE u8 UzesidUsdcCommitBlocks(UzesidUsdc *usdc, u32 first_block, u32 block_count){
 	if(usdc == 0 || block_count == 0)
 		return 1;
 	if(first_block >= usdc->header.total_blocks ||
@@ -738,8 +699,7 @@ UZESID_NOINLINE u8 UzesidUsdcCommitBlocks(UzesidUsdc *usdc, u32 first_block, u32
 	return 0;
 }
 
-UZESID_NOINLINE u8 UzesidUsdcWriteData(UzesidUsdc *usdc, u32 first_block, u32 offset_in_usd, const void *src, u16 len)
-{
+UZESID_NOINLINE u8 UzesidUsdcWriteData(UzesidUsdc *usdc, u32 first_block, u32 offset_in_usd, const void *src, u16 len){
 	u32 abs_offset;
 	if(usdc == 0 || src == 0)
 		return 1;
@@ -758,10 +718,11 @@ u8 UzesidUsdcWriteData(UzesidUsdc *usdc, u32 first_block, u32 offset_in_usd, con
 #endif
 
 /* ---- from uzsd_ro.c ---- */
+#if !defined(UZESID_PLAYBACK_SPI_ONLY) || !(UZESID_PLAYBACK_SPI_ONLY)
 static int uzsd_read_abs_entry_fallback(const UzesidUzsdStream *st, u32 offset_in_uzsd, void *dst, u16 len);
+#endif
 
-static void uzsd_prefetch_invalidate(void)
-{
+static void uzsd_prefetch_invalidate(void){
 	g_uzsd_prefetch_owner = 0;
 	g_uzsd_prefetch_valid = 0;
 	g_uzsd_prefetch_pos = 0;
@@ -770,8 +731,7 @@ static void uzsd_prefetch_invalidate(void)
 /* Fill a persistent linear window only when the requested stream position is
  * outside the current window.  A 192-byte fill usually covers many 50 Hz
  * register ticks, so playback no longer starts one SPI transaction per tick. */
-static int uzsd_prefetch_fill(const UzesidUzsdStream *st, u32 offset)
-{
+static int uzsd_prefetch_fill(const UzesidUzsdStream *st, u32 offset){
 	u32 remaining;
 	u16 want;
 
@@ -789,29 +749,29 @@ static int uzsd_prefetch_fill(const UzesidUzsdStream *st, u32 offset)
 	if(UzesidReadExact(&st->io, st->base_offset + offset,
 			g_uzsd_prefetch_buf, want) != 0)
 		return -1;
-	g_uzsd_prefetch_base = offset;
 	g_uzsd_prefetch_valid = (u8)want;
 	g_uzsd_prefetch_pos = 0;
 	g_uzsd_prefetch_owner = st;
 	return 0;
 }
 
-static int uzsd_read_u8(UzesidUzsdStream *st, u8 *out)
-{
-	if(out == 0)
-		return -1;
+static int uzsd_read_u8(UzesidUzsdStream *st, u8 *out){
+#if !defined(UZESID_PLAYBACK_SPI_ONLY) || !(UZESID_PLAYBACK_SPI_ONLY)
 	if(st->io.read_at == 0){
 		if(uzsd_read_abs_entry_fallback(st, st->cur_offset, out, 1) != 0)
 			return -1;
 		st->cur_offset++;
 		return 0;
 	}
+#endif
 	/* Playback is strictly linear between restart/loop operations.  Keep a
 	 * byte cursor inside the persistent window so the hot getc path avoids
 	 * 32-bit range comparisons and subtraction for every encoded byte. */
 	if(g_uzsd_prefetch_owner != st ||
 		g_uzsd_prefetch_pos >= g_uzsd_prefetch_valid){
-		if(uzsd_prefetch_fill(st, st->cur_offset) != 0)
+		if(st->cur_offset >= st->data_end ||
+			uzsd_prefetch_fill(st, st->cur_offset) != 0 ||
+			g_uzsd_prefetch_valid == 0u)
 			return -1;
 	}
 	*out = g_uzsd_prefetch_buf[g_uzsd_prefetch_pos++];
@@ -819,8 +779,48 @@ static int uzsd_read_u8(UzesidUzsdStream *st, u8 *out)
 	return 0;
 }
 
-static int uzsd_read_uleb128(UzesidUzsdStream *st, u32 *value)
-{
+void UzesidUzsdIdlePrefetch(UzesidUzsdStream *st){
+	u8 remain;
+	u16 want;
+	u32 fill_offset;
+	u32 available;
+
+	/* Compact the unread tail and refill the window while the main loop would
+	 * otherwise be waiting for vsync.  Cached playback remains byte-for-byte
+	 * identical; this only moves the SPI burst out of the audio hot path. */
+	if(st == 0 || st->io.read_at == 0 ||
+		g_uzsd_prefetch_owner != st ||
+		g_uzsd_prefetch_pos < (UZESID_STREAM_PREFETCH / 2u))
+		return;
+
+	/* Refill only after at least half the window was consumed. The previous
+	 * every-frame compaction repeatedly moved almost the entire unread tail,
+	 * wasting the idle time now reserved for smooth GUI updates. */
+	remain = (u8)(g_uzsd_prefetch_valid - g_uzsd_prefetch_pos);
+	if(remain != 0u)
+		memmove(g_uzsd_prefetch_buf,
+			g_uzsd_prefetch_buf + g_uzsd_prefetch_pos, remain);
+	g_uzsd_prefetch_valid = remain;
+	g_uzsd_prefetch_pos = 0u;
+
+	fill_offset = st->cur_offset + remain;
+	if(fill_offset >= st->data_end)
+		return;
+	available = st->data_end - fill_offset;
+	want = (u16)(UZESID_STREAM_PREFETCH - remain);
+	if((u32)want > available)
+		want = (u16)available;
+	if(want != 0u){
+		if(UzesidReadExact(&st->io, st->base_offset + fill_offset,
+				g_uzsd_prefetch_buf + remain, want) != 0){
+			uzsd_prefetch_invalidate();
+			return;
+		}
+		g_uzsd_prefetch_valid = (u8)(remain + want);
+	}
+}
+
+static int uzsd_read_uleb128(UzesidUzsdStream *st, u32 *value){
 	u32 v = 0;
 	u8 shift = 0;
 	u8 b;
@@ -842,8 +842,7 @@ static int uzsd_read_uleb128(UzesidUzsdStream *st, u32 *value)
 	return 0;
 }
 
-static int uzsd_decode_header(UzesidUzsdHeader *hdr, const u8 raw[UZESID_UZSD_HEADER_SIZE])
-{
+static int uzsd_decode_header(UzesidUzsdHeader *hdr, const u8 raw[UZESID_UZSD_HEADER_SIZE]){
 	memset(hdr, 0, sizeof(*hdr));
 	hdr->magic = UzesidRd32(raw + 0);
 	hdr->version = raw[4];
@@ -862,8 +861,7 @@ static int uzsd_decode_header(UzesidUzsdHeader *hdr, const u8 raw[UZESID_UZSD_HE
 	return 0;
 }
 
-int UzesidUzsdOpenFromReader(UzesidUzsdStream *st, const UzesidReader *io, u32 base_offset, u32 total_size)
-{
+int UzesidUzsdOpenFromReader(UzesidUzsdStream *st, const UzesidReader *io, u32 base_offset, u32 total_size){
 	u8 raw[UZESID_UZSD_HEADER_SIZE];
 
 	if(st == 0 || io == 0)
@@ -886,15 +884,13 @@ int UzesidUzsdOpenFromReader(UzesidUzsdStream *st, const UzesidReader *io, u32 b
 	return 0;
 }
 
-int UzesidUzsdOpenFromSpi(UzesidUzsdStream *st, u32 base_offset, u32 total_size)
-{
+int UzesidUzsdOpenFromSpi(UzesidUzsdStream *st, u32 base_offset, u32 total_size){
 	UzesidReader io;
 	UzesidSpiInitReader(&io, 0);
 	return UzesidUzsdOpenFromReader(st, &io, base_offset, total_size);
 }
 
-int UzesidUzsdOpenFromEntry(UzesidUzsdStream *st, const UzesidUsdc *usdc, const UzesidUsdcEntry *entry)
-{
+int UzesidUzsdOpenFromEntry(UzesidUzsdStream *st, const UzesidUsdc *usdc, const UzesidUsdcEntry *entry){
 	if(st == 0 || usdc == 0 || entry == 0)
 		return -1;
 	/* Wrap USDC entry data as a generic absolute reader via UzesidUsdcReadData. */
@@ -903,13 +899,11 @@ int UzesidUzsdOpenFromEntry(UzesidUzsdStream *st, const UzesidUsdc *usdc, const 
 	st->total_size = entry->usd_size;
 	if(entry->usd_size < UZESID_UZSD_HEADER_SIZE)
 		return -1;
-	{
-		u8 raw[UZESID_UZSD_HEADER_SIZE];
-		if(UzesidUsdcReadData(usdc, entry->first_block, 0, raw, (u16)sizeof(raw)) != 0)
-			return -1;
-		if(uzsd_decode_header(&st->header, raw) != 0)
-			return -1;
-	}
+	u8 raw[UZESID_UZSD_HEADER_SIZE];
+	if(UzesidUsdcReadData(usdc, entry->first_block, 0, raw, (u16)sizeof(raw)) != 0)
+		return -1;
+	if(uzsd_decode_header(&st->header, raw) != 0)
+		return -1;
 	/* Reuse io/base_offset fields through an internal trampoline. */
 	st->io.user = (void *)usdc;
 	st->io.read_at = 0;
@@ -924,14 +918,14 @@ int UzesidUzsdOpenFromEntry(UzesidUzsdStream *st, const UzesidUsdc *usdc, const 
 	return 0;
 }
 
-static int uzsd_read_abs_entry_fallback(const UzesidUzsdStream *st, u32 offset_in_uzsd, void *dst, u16 len)
-{
+#if !defined(UZESID_PLAYBACK_SPI_ONLY) || !(UZESID_PLAYBACK_SPI_ONLY)
+static int uzsd_read_abs_entry_fallback(const UzesidUzsdStream *st, u32 offset_in_uzsd, void *dst, u16 len){
 	const UzesidUsdc *usdc = (const UzesidUsdc *)st->io.user;
 	return UzesidUsdcReadData(usdc, st->base_offset, offset_in_uzsd, dst, len);
 }
+#endif
 
-int UzesidUzsdRestart(UzesidUzsdStream *st)
-{
+int UzesidUzsdRestart(UzesidUzsdStream *st){
 	if(st == 0)
 		return -1;
 	st->cur_offset = st->payload_offset;
@@ -946,25 +940,22 @@ int UzesidUzsdRestart(UzesidUzsdStream *st)
 /* Direct playback sink implemented by UzeSID.c.  Keeping this path here lets
  * the decoder apply a tick as it is read, avoiding the 52-byte temporary
  * UzesidUzsdTick and a second register-copy pass. */
-extern void UzesidUzeSidSinkBeginBatch(void *user);
-extern void UzesidUzeSidSinkWriteReg(void *user, u8 reg, u8 val);
-extern void UzesidUzeSidSinkEndBatch(void *user);
+extern void SIDBeginRegisterBatch(void);
+extern void SIDWriteRegister(u8 reg, u8 val);
+extern void SIDEndRegisterBatch(void);
 
-static int uzsd_v4_apply_next_tick_to_sid(UzesidUzsdStream *st, void *sink_user, u8 *ended_out)
-{
+static int uzsd_v4_apply_next_tick_to_sid(UzesidUzsdStream *st, void *sink_user, u8 *ended_out){
+	(void)sink_user;
 	u8 batching = 0;
 	for(;;)
 	{
 		u8 token, reg, code, val;
-		if(st->cur_offset >= st->data_end)
-		{
-			if(batching) UzesidUzeSidSinkEndBatch(sink_user);
-			if(ended_out != 0) *ended_out = 1;
-			return 1;
-		}
+		/* Valid v4 streams terminate by total_ticks or an END token. Let the
+		 * byte reader detect a truncated payload only when its window empties,
+		 * instead of doing a 32-bit offset comparison for every register token. */
 		if(uzsd_read_u8(st, &token) != 0)
 		{
-			if(batching) UzesidUzeSidSinkEndBatch(sink_user);
+			if(batching) SIDEndRegisterBatch();
 			return -1;
 		}
 		reg = (u8)(token & 31u);
@@ -975,7 +966,7 @@ static int uzsd_v4_apply_next_tick_to_sid(UzesidUzsdStream *st, void *sink_user,
 			{
 				if(uzsd_read_u8(st, &val) != 0)
 				{
-					if(batching) UzesidUzeSidSinkEndBatch(sink_user);
+					if(batching) SIDEndRegisterBatch();
 					return -1;
 				}
 			}
@@ -984,15 +975,15 @@ static int uzsd_v4_apply_next_tick_to_sid(UzesidUzsdStream *st, void *sink_user,
 			st->current_regs[reg] = val;
 			if(!batching)
 			{
-				UzesidUzeSidSinkBeginBatch(sink_user);
+				SIDBeginRegisterBatch();
 				batching = 1;
 			}
-			UzesidUzeSidSinkWriteReg(sink_user, reg, val);
+			SIDWriteRegister(reg, val);
 			continue;
 		}
 		if(reg == UZESID_UZSD_V4_CTRL_END_TICK && code == 0u)
 		{
-			if(batching) UzesidUzeSidSinkEndBatch(sink_user);
+			if(batching) SIDEndRegisterBatch();
 			st->ticks_done++;
 			return 0;
 		}
@@ -1010,13 +1001,12 @@ static int uzsd_v4_apply_next_tick_to_sid(UzesidUzsdStream *st, void *sink_user,
 			if(ended_out != 0) *ended_out = 1;
 			return 1;
 		}
-		if(batching) UzesidUzeSidSinkEndBatch(sink_user);
+		if(batching) SIDEndRegisterBatch();
 		return -1;
 	}
 }
 
-int UzesidUzsdApplyNextTickToSid(UzesidUzsdStream *st, void *sink_user, u8 *ended_out)
-{
+int UzesidUzsdApplyNextTickToSid(UzesidUzsdStream *st, void *sink_user, u8 *ended_out){
 	u8 op;
 	u8 i;
 
@@ -1063,18 +1053,18 @@ int UzesidUzsdApplyNextTickToSid(UzesidUzsdStream *st, void *sink_user, u8 *ende
 			u8 count;
 			if(uzsd_read_u8(st, &count) != 0 || count > UZESID_UZSD_INIT_REG_COUNT)
 				return -1;
-			if(count != 0) UzesidUzeSidSinkBeginBatch(sink_user);
+			if(count != 0) SIDBeginRegisterBatch();
 			for(i = 0; i < count; i++)
 			{
 				u8 reg, val;
 				if(uzsd_read_u8(st, &reg) != 0 || uzsd_read_u8(st, &val) != 0)
 				{
-					if(count != 0) UzesidUzeSidSinkEndBatch(sink_user);
+					if(count != 0) SIDEndRegisterBatch();
 					return -1;
 				}
-				UzesidUzeSidSinkWriteReg(sink_user, reg, val);
+				SIDWriteRegister(reg, val);
 			}
-			if(count != 0) UzesidUzeSidSinkEndBatch(sink_user);
+			if(count != 0) SIDEndRegisterBatch();
 			st->ticks_done++;
 			return 0;
 		}
@@ -1089,7 +1079,7 @@ int UzesidUzsdApplyNextTickToSid(UzesidUzsdStream *st, void *sink_user, u8 *ende
 			   uzsd_read_u8(st, &mask[3]) != 0)
 				return -1;
 			any = (u8)(mask[0] | mask[1] | mask[2] | (mask[3] & 1u));
-			if(any != 0) UzesidUzeSidSinkBeginBatch(sink_user);
+			if(any != 0) SIDBeginRegisterBatch();
 			for(i = 0; i < UZESID_UZSD_INIT_REG_COUNT; i++)
 			{
 				u8 bit = (u8)(1u << (i & 7u));
@@ -1098,13 +1088,13 @@ int UzesidUzsdApplyNextTickToSid(UzesidUzsdStream *st, void *sink_user, u8 *ende
 					u8 val;
 					if(uzsd_read_u8(st, &val) != 0)
 					{
-						if(any != 0) UzesidUzeSidSinkEndBatch(sink_user);
+						if(any != 0) SIDEndRegisterBatch();
 						return -1;
 					}
-					UzesidUzeSidSinkWriteReg(sink_user, i, val);
+					SIDWriteRegister(i, val);
 				}
 			}
-			if(any != 0) UzesidUzeSidSinkEndBatch(sink_user);
+			if(any != 0) SIDEndRegisterBatch();
 			st->ticks_done++;
 			return 0;
 		}
@@ -1118,8 +1108,7 @@ int UzesidUzsdApplyNextTickToSid(UzesidUzsdStream *st, void *sink_user, u8 *ende
 }
 
 #if !defined(UZESID_DIRECT_SID_ONLY) || !(UZESID_DIRECT_SID_ONLY)
-static int uzsd_v4_next_tick(UzesidUzsdStream *st, UzesidUzsdTick *tick)
-{
+static int uzsd_v4_next_tick(UzesidUzsdStream *st, UzesidUzsdTick *tick){
 	for(;;)
 	{
 		u8 token, reg, code, val;
@@ -1161,8 +1150,7 @@ static int uzsd_v4_next_tick(UzesidUzsdStream *st, UzesidUzsdTick *tick)
 	}
 }
 
-int UzesidUzsdNextTick(UzesidUzsdStream *st, UzesidUzsdTick *tick)
-{
+int UzesidUzsdNextTick(UzesidUzsdStream *st, UzesidUzsdTick *tick){
 	u8 op;
 	u8 i;
 

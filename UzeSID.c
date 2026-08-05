@@ -25,7 +25,6 @@ u16 cia_timer;
 u32 f_rand_seed = 1;
 u8 k_gain_q12_4_mv[3] = {0,0,0};
 static u16 sid_cycles;
-static int speed_adjust;
 static u16 k_q8_8;
 #if UZESID_SYNTH_DUP == 2u
 static u8 sid_interp_prev = 128u;
@@ -68,15 +67,14 @@ struct voice_t {
 	u16 eg_level;
 	u8  amp;
 
-	u32 noise;
+	u8 noise_lo;
+	u8 noise_mid;
+	u8 noise_hi;
 
 	u8 gate;
 	u8 ring;
 	u8 test;
-	u8 filter;
-
 	u8 sync;
-	u8 mute;
 };
 
 struct osid_t {
@@ -90,14 +88,15 @@ static osid_t sid_instance;
 static osid_t *sid = &sid_instance;
 
 enum { WAVE_NONE, WAVE_TRI, WAVE_SAW, WAVE_RECT, WAVE_NOISE };
-enum { EG_IDLE, EG_ATTACK, EG_DECAY, EG_RELEASE };
+/* Idle and sustain require no periodic work.  Keep the three moving states
+ * contiguous so the audio-rate envelope gate is a single comparison. */
+enum { EG_IDLE, EG_SUSTAIN, EG_ATTACK, EG_DECAY, EG_RELEASE };
 
 /* Audio-rate lookup tables trade plentiful flash for AVR cycles. */
 static const u8 sid_wave_mode_map[16] PROGMEM = {
 	0x00,0x01,0x02,0x02,0x03,0x02,0x02,0x02,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 };
-static void osid_init(osid_t *S, int n)
-{
+static void osid_init(osid_t *S, int n){
 	(void)n;
 	S->voice[0].mod_by = &S->voice[2];
 	S->voice[1].mod_by = &S->voice[0];
@@ -107,13 +106,11 @@ static void osid_init(osid_t *S, int n)
 	S->voice[2].mod_to = &S->voice[0];
 }
 
-static inline u8 clamp_gain_u8(u16 gain)
-{
+static inline u8 clamp_gain_u8(u16 gain){
 	return (gain > 255u) ? 255u : (u8)gain;
 }
 
-static inline void update_voice_amp(voice_t *v, u8 gain)
-{
+static inline void update_voice_amp(voice_t *v, u8 gain){
 	u8 env = (u8)(v->eg_level >> 8);
 	/* SID volume, envelope, per-channel gain, and the user master volume all
 	 * change far more slowly than oscillator phase.  Cache their product here
@@ -139,15 +136,12 @@ static inline void update_voice_amp(voice_t *v, u8 gain)
 	);
 	v->amp = amp;
 #else
-	{
-		u16 amp = (u16)(((u16)env * gain) >> 8);
-		v->amp = (u8)((amp * masterVolume) >> 6);
-	}
+	u16 amp = (u16)(((u16)env * gain) >> 8);
+	v->amp = (u8)((amp * masterVolume) >> 6);
 #endif
 }
 
-static void update_sid_gains(osid_t *S)
-{
+static void update_sid_gains(osid_t *S){
 	u8 i;
 	voice_t *v = &S->voice[0];
 	for(i = 0; i < 3u; i++, v++){
@@ -156,8 +150,7 @@ static void update_sid_gains(osid_t *S)
 	}
 }
 
-void osid_reset(osid_t *S)
-{
+void osid_reset(osid_t *S){
 	int v;
 	memset(S->regs, 0, sizeof(S->regs));
 	S->last_written_byte = 0;
@@ -180,57 +173,61 @@ void osid_reset(osid_t *S)
 		S->voice[v].gate = 0;
 		S->voice[v].ring = 0;
 		S->voice[v].test = 0;
-		S->voice[v].filter = 0;
 		S->voice[v].sync = 0;
-		S->voice[v].mute = 0;
 		/* The physical SID noise LFSR powers up non-zero.  A zero state never
 		 * advances and was one source of incorrect percussion timbre. */
-		S->voice[v].noise = 0x007ffff8UL;
+		S->voice[v].noise_lo = 0xf8u;
+		S->voice[v].noise_mid = 0xffu;
+		S->voice[v].noise_hi = 0x7fu;
 	}
 #if UZESID_SYNTH_DUP == 2u
 	sid_interp_prev = 128u;
 	sid_interp_valid = 0u;
 #endif
-	sid_env_phase = 0u;
+	sid_env_phase = UZESID_ENV_DECIMATE;
 	sid_batch_active = 0u;
 	sid_derived_dirty = 0u;
 	update_sid_gains(S);
 }
 
-static inline u32 freq_to_add(u16 freq)
-{
+#ifdef __AVR__
+extern u32 Mul16Q8(u16 value, u16 scale);
+#endif
+
+static inline u32 freq_to_add(u16 freq){
 	/* Keep the 24-bit SID phase in bits 31..8 of a natural-overflowing u32.
-	 * The low byte remains zero so this is exactly the previous 24-bit step,
-	 * merely left-aligned.  Natural 32-bit overflow replaces a mask in every
-	 * voice/sample iteration. */
+	 * Both operands are 16-bit.  The AVR helper returns their exact product
+	 * with byte zero cleared, avoiding the generic 32-bit multiply routine on
+	 * pitch-heavy register frames. */
+#ifdef __AVR__
+	return Mul16Q8(freq, k_q8_8);
+#else
 	return ((u32)freq * k_q8_8) & 0xffffff00UL;
+#endif
 }
 
-static void sid_begin_register_batch(void)
-{
+void SIDBeginRegisterBatch(void){
 	sid_derived_dirty = 0u;
 	sid_batch_active = 1u;
 }
 
-static void sid_end_register_batch(void)
-{
+void SIDEndRegisterBatch(void){
 	u8 dirty = sid_derived_dirty;
-	u8 i;
 
-	/* Clear batching first so any future helper that writes a register cannot
-	 * accidentally leave another deferred update pending. */
+	/* The player has exactly three voices.  Explicit tests avoid loop/index
+	 * arithmetic at every register tick, which matters for fast CIA tunes. */
 	sid_batch_active = 0u;
-	sid_derived_dirty = 0u;
-	for(i = 0u; i < 3u; i++){
-		if(dirty & SID_DIRTY_FREQ(i))
-			sid->voice[i].add = freq_to_add(sid->voice[i].freq);
-	}
+	if(dirty & SID_DIRTY_FREQ(0))
+		sid->voice[0].add = freq_to_add(sid->voice[0].freq);
+	if(dirty & SID_DIRTY_FREQ(1))
+		sid->voice[1].add = freq_to_add(sid->voice[1].freq);
+	if(dirty & SID_DIRTY_FREQ(2))
+		sid->voice[2].add = freq_to_add(sid->voice[2].freq);
 	if(dirty & SID_DIRTY_GAIN)
 		update_sid_gains(sid);
 }
 
-static void SIDClockFreqChanged(void)
-{
+static void SIDClockFreqChanged(void){
 	static const u16 div[16] = { 9,32,63,95,149,220,267,313,392,977,1954,3126,3906,11720,19531,31251 };
 	u32 envelope_numerator;
 	u8 i;
@@ -252,8 +249,7 @@ static void SIDClockFreqChanged(void)
 	osid_write(sid, 14, sid->regs[14], 0, 0);
 }
 
-void SIDSetClockHz(u32 clock_hz)
-{
+void SIDSetClockHz(u32 clock_hz){
 	/* Accept the normal PAL/NTSC SID range and ignore corrupt cache headers. */
 	if(clock_hz < 900000UL || clock_hz > 1100000UL)
 		return;
@@ -263,10 +259,8 @@ void SIDSetClockHz(u32 clock_hz)
 	SIDClockFreqChanged();
 }
 
-void SIDInit(void)
-{
+void SIDInit(void){
 	cycles_per_second = SID_DEFAULT_CLOCK_HZ;
-	speed_adjust = 100;
 	CPUInit();
 	MemoryInit();
 	osid_init(sid, 0);
@@ -275,14 +269,12 @@ void SIDInit(void)
 	g_uzesid_psid_loaded = 0;
 }
 
-void SIDReset(cycle_t now)
-{
+void SIDReset(cycle_t now){
 	(void)now;
 	osid_reset(sid);
 }
 
-u32 osid_read(osid_t *S, u32 adr, cycle_t now)
-{
+u32 osid_read(osid_t *S, u32 adr, cycle_t now){
 	(void)now;
 	switch(adr){
 		case 0x19:
@@ -301,8 +293,7 @@ u32 osid_read(osid_t *S, u32 adr, cycle_t now)
 	}
 }
 
-static inline void cap_note(u8 reg, u8 val)
-{
+static inline void cap_note(u8 reg, u8 val){
 #if UZESID_ENABLE_CAPTURE
 	UzesidCaptureNoteWrite(reg, val);
 #else
@@ -311,128 +302,180 @@ static inline void cap_note(u8 reg, u8 val)
 #endif
 }
 
-void osid_write(osid_t *S, u32 adr, u32 byte, cycle_t now, u8 rmw)
-{
-	int v;
+static void sid_apply_register(osid_t *S, u8 adr, u8 byte){
+	u8 v;
+	u8 local;
+	voice_t *voice;
+
+	/* Voice registers are three identical seven-byte groups.  Mapping with two
+	 * compares is substantially cheaper on AVR than dividing every cached
+	 * register number by seven. */
+	if(adr < 7u){
+		v = 0u;
+		local = adr;
+	}else if(adr < 14u){
+		v = 1u;
+		local = (u8)(adr - 7u);
+	}else if(adr < 21u){
+		v = 2u;
+		local = (u8)(adr - 14u);
+	}else{
+		if(adr == 24u){
+			S->volume = (u8)(byte & 0x0fu);
+			if(sid_batch_active)
+				sid_derived_dirty |= SID_DIRTY_GAIN;
+			else
+				update_sid_gains(S);
+		}
+		return;
+	}
+
+	voice = &S->voice[v];
+	switch(local){
+		case 0:
+			voice->freq = (u16)((voice->freq & 0xff00u) | (u16)byte);
+			if(sid_batch_active)
+				sid_derived_dirty |= SID_DIRTY_FREQ(v);
+			else
+				voice->add = freq_to_add(voice->freq);
+			break;
+
+		case 1:
+			voice->freq = (u16)((voice->freq & 0x00ffu) | ((u16)byte << 8));
+			if(sid_batch_active)
+				sid_derived_dirty |= SID_DIRTY_FREQ(v);
+			else
+				voice->add = freq_to_add(voice->freq);
+			break;
+
+		case 2:
+			voice->pw = (u16)((voice->pw & 0x0f00u) | (u16)byte);
+			break;
+
+		case 3:
+			voice->pw = (u16)((voice->pw & 0x00ffu) |
+				(((u16)byte & 0x0fu) << 8));
+			break;
+
+		case 4:
+			voice->wave = pgm_read_byte(&sid_wave_mode_map[(byte >> 4) & 0x0f]);
+			if((byte & 1u) != voice->gate){
+				if(byte & 1u)
+					voice->eg_state = EG_ATTACK;
+				else if(voice->eg_state != EG_IDLE)
+					voice->eg_state = EG_RELEASE;
+				/* Apply a gate transition on the next sample rather than waiting up
+				 * to a complete decimation block. */
+				sid_env_phase = 1u;
+			}
+			voice->gate = (u8)(byte & 1u);
+			voice->mod_by->sync = (u8)(byte & 2u);
+			voice->ring = (u8)(byte & 4u);
+			voice->test = (u8)(byte & 8u);
+			if(voice->test)
+				voice->count = 0;
+			break;
+
+		case 5:
+			voice->a_add = eg_table[(byte >> 4) & 0x0f];
+			voice->d_sub = eg_table[byte & 0x0f];
+			break;
+
+		default: /* local register 6 */
+			voice->s_level = (u16)((byte >> 4) & 0x0f) << 12;
+			voice->r_sub = eg_table[byte & 0x0f];
+			/* A sustain-level write must wake a held envelope so it can settle
+			 * to the new level on the next decimated envelope step. */
+			if(voice->eg_state == EG_SUSTAIN)
+				voice->eg_state = EG_DECAY;
+			break;
+	}
+}
+
+void osid_write(osid_t *S, u32 adr, u32 byte, cycle_t now, u8 rmw){
+	u8 reg;
 	(void)now;
 	(void)rmw;
 
-	if((adr & 0x1f) < 0x1d)
-		adr &= 0x1f;
+	reg = (u8)(adr & 0x1fu);
+	if(reg >= 0x1du)
+		return;
 
-	S->last_written_byte = S->regs[adr] = (u8)byte;
-	cap_note((u8)adr, (u8)byte);
+	S->last_written_byte = S->regs[reg] = (u8)byte;
+	cap_note(reg, (u8)byte);
 #if UZESID_ENABLE_CAPTURE
 	/* During pre-emulation the ordered register transitions are captured, but
 	 * oscillator/envelope synthesis is unnecessary until stream playback. */
 	if(g_uzesid_capture_enabled)
 		return;
 #endif
-	v = (int)(adr / 7);
-
-	switch(adr){
-		case 0:
-		case 7:
-		case 14:
-			S->voice[v].freq = (u16)((S->voice[v].freq & 0xff00u) | (u16)byte);
-			if(sid_batch_active)
-				sid_derived_dirty |= SID_DIRTY_FREQ(v);
-			else
-				S->voice[v].add = freq_to_add(S->voice[v].freq);
-			break;
-
-		case 1:
-		case 8:
-		case 15:
-			S->voice[v].freq = (u16)((S->voice[v].freq & 0x00ffu) | ((u16)byte << 8));
-			if(sid_batch_active)
-				sid_derived_dirty |= SID_DIRTY_FREQ(v);
-			else
-				S->voice[v].add = freq_to_add(S->voice[v].freq);
-			break;
-
-		case 2:
-		case 9:
-		case 16:
-			S->voice[v].pw = (u16)((S->voice[v].pw & 0x0f00u) | (u16)byte);
-			break;
-		case 3:
-		case 10:
-		case 17:
-			S->voice[v].pw = (u16)((S->voice[v].pw & 0x00ffu) | (((u16)byte & 0x0fu) << 8));
-			break;
-
-		case 4:
-		case 11:
-		case 18:
-			S->voice[v].wave = pgm_read_byte(&sid_wave_mode_map[(byte >> 4) & 0x0f]);
-			if((byte & 1u) != S->voice[v].gate){
-				if(byte & 1u)
-					S->voice[v].eg_state = EG_ATTACK;
-				else if(S->voice[v].eg_state != EG_IDLE)
-					S->voice[v].eg_state = EG_RELEASE;
-				/* Apply a gate transition on the next sample rather than waiting up
-				 * to a complete decimation block. */
-				sid_env_phase = (u8)(UZESID_ENV_DECIMATE - 1u);
-			}
-			S->voice[v].gate = (u8)(byte & 1u);
-			S->voice[v].mod_by->sync = (u8)(byte & 2u);
-			S->voice[v].ring = (u8)(byte & 4u);
-			S->voice[v].test = (u8)(byte & 8u);
-			if(S->voice[v].test)
-				S->voice[v].count = 0;
-			break;
-
-		case 5:
-		case 12:
-		case 19:
-			S->voice[v].a_add = eg_table[(byte >> 4) & 0x0f];
-			S->voice[v].d_sub = eg_table[byte & 0x0f];
-			break;
-
-		case 6:
-		case 13:
-		case 20:
-			S->voice[v].s_level = (u16)((byte >> 4) & 0x0f) << 12;
-			S->voice[v].r_sub = eg_table[byte & 0x0f];
-			break;
-
-		case 24:
-			S->volume = (u8)(byte & 0x0f);
-			if(sid_batch_active)
-				sid_derived_dirty |= SID_DIRTY_GAIN;
-			else
-				update_sid_gains(S);
-			break;
-		default:
-			break;
-	}
+	sid_apply_register(S, reg, (u8)byte);
 }
 
-u32 sid_read(u32 adr, cycle_t now)
-{
+u32 sid_read(u32 adr, cycle_t now){
 	return osid_read(sid, adr - 0xd400u, now);
 }
 
-void sid_write(u32 adr, u32 byte, cycle_t now, u8 rmw)
-{
+void sid_write(u32 adr, u32 byte, cycle_t now, u8 rmw){
 	osid_write(sid, adr - 0xd400u, byte, now, rmw);
 }
 
-static inline void sid_noise_clock(voice_t *v)
-{
-	u32 n = v->noise;
-	u8 feedback = (u8)(((n >> 22) ^ (n >> 17)) & 1u);
-	v->noise = ((n << 1) | feedback) & 0x007fffffUL;
+static inline void sid_noise_step(u8 *lo_out, u8 *mid_out, u8 *hi_out){
+	u8 lo = *lo_out;
+	u8 mid = *mid_out;
+	u8 hi = *hi_out;
+#ifdef __AVR__
+	u8 feedback;
+	u8 tap;
+	asm volatile(
+		"clr %3\n\t"
+		"bst %2,1\n\t"
+		"bld %3,0\n\t"
+		"clr %4\n\t"
+		"bst %2,6\n\t"
+		"bld %4,0\n\t"
+		"eor %3,%4\n\t"
+		"lsl %0\n\t"
+		"rol %1\n\t"
+		"rol %2\n\t"
+		"or %0,%3\n\t"
+		: "+r" (lo), "+r" (mid), "+r" (hi),
+		  "=&r" (feedback), "=&r" (tap)
+		:
+		: "cc"
+	);
+#else
+	{
+		u8 feedback = (u8)(((hi >> 6) ^ (hi >> 1)) & 1u);
+		hi = (u8)((hi << 1) | (mid >> 7));
+		mid = (u8)((mid << 1) | (lo >> 7));
+		lo = (u8)((lo << 1) | feedback);
+	}
+#endif
+	*lo_out = lo;
+	*mid_out = mid;
+	*hi_out = hi;
 }
 
-static inline u8 sid_noise_byte(u32 n)
-{
-	/* Exact output taps from the 23-bit SID noise shift register.  This saves
-	 * 640 bytes of lookup tables; it is evaluated only for a noise voice. */
-	u8 lo = (u8)n;
-	u8 mid = (u8)(n >> 8);
-	u8 hi = (u8)(n >> 16);
+static inline u8 sid_noise_byte(u8 lo, u8 mid, u8 hi){
+#ifdef __AVR__
+	u8 out;
+	asm volatile(
+		"clr %0\n\t"
+		"bst %1,2\n\t" "bld %0,0\n\t"
+		"bst %1,4\n\t" "bld %0,1\n\t"
+		"bst %1,7\n\t" "bld %0,2\n\t"
+		"bst %2,3\n\t" "bld %0,3\n\t"
+		"bst %2,5\n\t" "bld %0,4\n\t"
+		"bst %3,0\n\t" "bld %0,5\n\t"
+		"bst %3,4\n\t" "bld %0,6\n\t"
+		"bst %3,6\n\t" "bld %0,7\n\t"
+		: "=&r" (out)
+		: "r" (lo), "r" (mid), "r" (hi)
+		: "cc"
+	);
+	return out;
+#else
 	return (u8)(((lo >> 2) & 0x01u) |
 	            ((lo >> 3) & 0x02u) |
 	            ((lo >> 5) & 0x04u) |
@@ -441,14 +484,14 @@ static inline u8 sid_noise_byte(u32 n)
 	            ((hi << 5) & 0x20u) |
 	            ((hi << 2) & 0x40u) |
 	            ((hi << 1) & 0x80u));
+#endif
 }
 
-static inline s8 voice_wave8(voice_t *v)
-{
+static inline s8 voice_wave8(voice_t *v, u8 wave){
 	u32 phase = v->count;
 	u8 top = (u8)(phase >> 24);
 
-	switch(v->wave){
+	switch(wave){
 		case WAVE_TRI: /* triangle, optionally ring-modulated */
 		{
 			u8 t;
@@ -463,15 +506,12 @@ static inline s8 voice_wave8(voice_t *v)
 			return (s8)(top ^ 0x80u);
 		case WAVE_RECT: /* pulse; threshold uses the upper 12 phase bits */
 			return (((u16)(phase >> 20)) < v->pw) ? 127 : -128;
-		case WAVE_NOISE:
-			return (s8)(sid_noise_byte(v->noise) ^ 0x80u);
 		default:
 			return 0;
 	}
 }
 
-static inline void update_envelope(voice_t *v)
-{
+static inline void update_envelope(voice_t *v){
 	switch(v->eg_state){
 		case EG_ATTACK: {
 			u16 old = v->eg_level;
@@ -484,10 +524,12 @@ static inline void update_envelope(voice_t *v)
 		}
 		case EG_DECAY:
 			if(v->eg_level <= v->s_level ||
-			   (u16)(v->eg_level - v->s_level) <= v->d_sub)
+			   (u16)(v->eg_level - v->s_level) <= v->d_sub){
 				v->eg_level = v->s_level;
-			else
+				v->eg_state = EG_SUSTAIN;
+			}else{
 				v->eg_level = (u16)(v->eg_level - v->d_sub);
+			}
 			break;
 		case EG_RELEASE:
 			if(v->eg_level <= v->r_sub){
@@ -502,19 +544,18 @@ static inline void update_envelope(voice_t *v)
 	}
 }
 
-static inline void update_all_envelopes(osid_t *S)
-{
+static inline void update_all_envelopes(osid_t *S){
 	u8 i;
 	voice_t *v = &S->voice[0];
 	for(i = 0; i < 3u; i++, v++){
-		if(v->eg_state != EG_IDLE)
+		if(v->eg_state >= EG_ATTACK){
 			update_envelope(v);
-		update_voice_amp(v, k_gain_q12_4_mv[i]);
+			update_voice_amp(v, k_gain_q12_4_mv[i]);
+		}
 	}
 }
 
-static inline s8 sid_scale_wave_amp(s8 wave, u8 amp)
-{
+static inline s8 sid_scale_wave_amp(s8 wave, u8 amp){
 #ifdef __AVR__
 	s8 scaled;
 	/* AVR has a native signed-by-unsigned 8x8 multiply.  Only product bits
@@ -527,53 +568,68 @@ static inline s8 sid_scale_wave_amp(s8 wave, u8 amp)
 		"clr __zero_reg__\n\t"
 		"asr %0\n\t"
 		"asr %0\n\t"
-#if UZESID_MIX_SHIFT == 1u
-		"asr %0\n\t"
-#endif
 		: "=&r" (scaled)
 		: "a" (wave), "a" (amp)
 		: "r0", "r1"
 	);
 	return scaled;
 #else
-	return (s8)(((s16)wave * (u16)amp) >> (10u + UZESID_MIX_SHIFT));
+	return (s8)(((s16)wave * (u16)amp) >> 10u);
 #endif
 }
 
-static inline s16 calc_voice_sample(voice_t *v)
-{
+static inline s8 calc_voice_sample(voice_t *v){
 	u32 old_phase;
 	u32 new_phase;
+	u8 wave;
+	u8 amp;
+	u8 noise_sample = 0u;
 
-	if(v->mute || v->test)
+	if(v->test)
 		return 0;
 
 	old_phase = v->count;
 	new_phase = old_phase + v->add;
 	v->count = new_phase;
 
-	if(new_phase < old_phase && v->sync)
+	/* SID phase increments remain below 2^31, so a 32-bit wrap necessarily
+	 * makes the new high byte smaller.  Avoid a four-byte comparison. */
+	if(v->sync && (u8)(new_phase >> 24) < (u8)(old_phase >> 24))
 		v->mod_to->count = 0;
 
-	if(v->wave == WAVE_NOISE){
-		u32 p = old_phase & 0x0fffffffUL;
-		u8 clocks = (u8)(((p + v->add + 0x08000000UL) >> 28) -
-		                 ((p + 0x08000000UL) >> 28));
+	wave = v->wave;
+	if(wave == WAVE_NOISE){
+		/* Noise clocks on rising edges of oscillator bit 19.  With the
+		 * 24-bit phase left-aligned, the biased 2^28 bucket is encoded in
+		 * the upper byte.  The phase increment is below half the 32-bit
+		 * range, so the modulo-16 bucket delta is the exact clock count. */
+		u8 old_bucket = (u8)((u8)((u8)(old_phase >> 24) + 8u) >> 4);
+		u8 new_bucket = (u8)((u8)((u8)(new_phase >> 24) + 8u) >> 4);
+		u8 clocks = (u8)((new_bucket - old_bucket) & 0x0fu);
+		u8 lo = v->noise_lo;
+		u8 mid = v->noise_mid;
+		u8 hi = v->noise_hi;
 		while(clocks-- != 0u)
-			sid_noise_clock(v);
+			sid_noise_step(&lo, &mid, &hi);
+		v->noise_lo = lo;
+		v->noise_mid = mid;
+		v->noise_hi = hi;
+		noise_sample = sid_noise_byte(lo, mid, hi);
 	}
 
-	if(v->amp != 0u && v->wave != WAVE_NONE)
-		return (s16)sid_scale_wave_amp(voice_wave8(v), v->amp);
-	return 0;
+	amp = v->amp;
+	if(amp == 0u || wave == WAVE_NONE)
+		return 0;
+	if(wave == WAVE_NOISE)
+		return sid_scale_wave_amp((s8)(noise_sample ^ 0x80u), amp);
+	return sid_scale_wave_amp(voice_wave8(v, wave), amp);
 }
 
-static s16 calc_sid_sample(osid_t *S)
-{
-	s16 sum_output;
+static s8 calc_sid_sample(osid_t *S){
+	s8 sum_output;
 
-	if(++sid_env_phase >= UZESID_ENV_DECIMATE){
-		sid_env_phase = 0u;
+	if(--sid_env_phase == 0u){
+		sid_env_phase = UZESID_ENV_DECIMATE;
 		update_all_envelopes(S);
 	}
 
@@ -585,30 +641,26 @@ static s16 calc_sid_sample(osid_t *S)
 	return sum_output;
 }
 
-static inline u8 q8u(s16 mix)
-{
-	s16 sample = (s16)(mix + 128);
-	if(sample < 0) sample = 0;
-	if(sample > 255) sample = 255;
-	return (u8)sample;
+static inline u8 q8u(s8 mix){
+	/* sid_scale_wave_amp() limits each voice to -32..31.  Three voices therefore
+	 * remain inside -96..93, so the old two-branch saturation could never fire. */
+	return (u8)((u8)mix ^ 0x80u);
 }
 
-static void calc_buffer(u8 *buf, int count)
-{
+static void calc_pairs(u8 *buf, u8 pairs){
 #if UZESID_SYNTH_DUP == 1u
-	/* Experimental native 15.72 kHz synthesis.  Every DAC sample advances all
-	 * three SID oscillators; no reconstruction filter is required. */
-	while(count-- > 0)
+	/* Native mode still schedules in 7.86 kHz pairs.  Emit two genuine samples
+	 * per 8-bit loop iteration instead of paying a 16-bit loop test 262 times. */
+	while(pairs-- != 0u){
 		*buf++ = q8u(calc_sid_sample(sid));
+		*buf++ = q8u(calc_sid_sample(sid));
+	}
 #else
-	u16 pairs = (u16)count >> 1;
-
 	/* Default: synthesize at 7.86 kHz, then linearly reconstruct the
 	 * intermediate 15.72 kHz sample. */
 	while(pairs-- != 0u){
-		s16 mix = calc_sid_sample(sid);
-		u8 current;
-		current = q8u(mix);
+		s8 mix = calc_sid_sample(sid);
+		u8 current = q8u(mix);
 		if(!sid_interp_valid){
 			sid_interp_prev = current;
 			sid_interp_valid = 1u;
@@ -620,74 +672,66 @@ static void calc_buffer(u8 *buf, int count)
 #endif
 }
 
-void cia_tl_write(u8 byte)
-{
+void cia_tl_write(u8 byte){
 	cia_timer = (u16)((cia_timer & 0xff00u) | byte);
 }
 
-void cia_th_write(u8 byte)
-{
+void cia_th_write(u8 byte){
 	cia_timer = (u16)((cia_timer & 0x00ffu) | ((u16)byte << 8));
 }
 
-void SIDExit(void)
-{
+void SIDExit(void){
 }
 
-void SIDCalcBuffer(u8 *buf, int count)
-{
-	calc_buffer(buf, count);
+void SIDCalcBuffer(u8 *buf, int count){
+	u16 samples;
+	if(buf == 0 || count <= 0)
+		return;
+	samples = (u16)count;
+	calc_pairs(buf, (u8)(samples >> 1));
+	if(samples & 1u)
+		buf[samples - 1u] = q8u(calc_sid_sample(sid));
 }
 
-void SIDExecute(void)
-{
+void SIDExecute(void){
 	EmulationUpdatePlayAdr();
 	if(play_adr != 0)
 		CPUExecute(play_adr, 0, 0, 0, 1000000);
 }
 
-void SIDSetReplayFreq(int freq)
-{
+void SIDSetReplayFreq(int freq){
 	if(freq <= 0)
 		return;
 	cia_timer = (u16)(cycles_per_second / (u32)freq - 1u);
 }
 
-void SIDAdjustSpeed(int percent)
-{
-	if(percent < 1)
-		percent = 1;
-	speed_adjust = percent;
-	(void)speed_adjust;
+void SIDAdjustSpeed(int percent){
+	(void)percent;
 }
 
-void SIDWriteRegister(int reg, u8 val)
-{
-	if(reg < 0)
-		return;
-	osid_write(sid, (u32)(reg & 0x7f), val, 0, 0);
+void SIDWriteRegister(u8 reg, u8 val){
+	/* Cached playback already maintains its own register mirror for delta
+	 * decoding. Avoid duplicate range checks and a second register-file store
+	 * on every event in the audio hot path. */
+	sid_apply_register(sid, reg, val);
 }
 
-void UzeSID_CopyRegs(u8 *dst, u8 count)
-{
+void UzeSID_CopyRegs(u8 *dst, u8 count){
 	u8 i;
 	if(count > 128u) count = 128u;
 	for(i = 0; i < count; i++) dst[i] = sid->regs[i];
 }
 
-u64 GetTicks_usec(void)
-{
+u64 GetTicks_usec(void){
 	return 0;
 }
 
-void Delay_usec(u32 usec)
-{
+void Delay_usec(u32 usec){
 	(void)usec;
 }
 
 /* ---- player runtime ---- */
-static void player_apply_init(const UzesidPlayer *pl)
-{
+static void player_apply_init(const UzesidPlayer *pl){
 	u8 i;
 
 	if(pl == 0 || pl->sink.write_reg == 0)
@@ -714,8 +758,7 @@ static void player_apply_init(const UzesidPlayer *pl)
 #define UZESID_AUDIO_PAIR_RATE ((u16)(SAMPLE_RATE / 2UL))
 #define UZESID_AUDIO_PAIRS_PER_FRAME ((u8)(UZESID_FRAME_SAMPLES / 2u))
 
-int UzesidPlayerRestart(UzesidPlayer *pl)
-{
+int UzesidPlayerRestart(UzesidPlayer *pl){
 	if(pl == 0)
 		return -1;
 	if(UzesidUzsdRestart(&pl->stream) != 0)
@@ -732,8 +775,7 @@ int UzesidPlayerRestart(UzesidPlayer *pl)
 }
 
 
-int UzesidPlayerOpenStream(UzesidPlayer *pl, const UzesidUzsdStream *stream, const UzesidUsdcEntry *entry, const UzesidSidSink *sink, u8 auto_loop)
-{
+int UzesidPlayerOpenStream(UzesidPlayer *pl, const UzesidUzsdStream *stream, const UzesidUsdcEntry *entry, const UzesidSidSink *sink, u8 auto_loop){
 	if(pl == 0 || stream == 0 || sink == 0 || sink->write_reg == 0)
 		return -1;
 	memset(pl, 0, sizeof(*pl));
@@ -756,16 +798,14 @@ int UzesidPlayerOpenStream(UzesidPlayer *pl, const UzesidUzsdStream *stream, con
 	return 0;
 }
 
-int UzesidPlayerOpenSpiTemp(UzesidPlayer *pl, u32 base_offset, u32 total_size, const UzesidUsdcEntry *entry, const UzesidSidSink *sink, u8 auto_loop)
-{
+int UzesidPlayerOpenSpiTemp(UzesidPlayer *pl, u32 base_offset, u32 total_size, const UzesidUsdcEntry *entry, const UzesidSidSink *sink, u8 auto_loop){
 	UzesidUzsdStream stream;
 	if(UzesidUzsdOpenFromSpi(&stream, base_offset, total_size) != 0)
 		return -1;
 	return UzesidPlayerOpenStream(pl, &stream, entry, sink, auto_loop);
 }
 
-int UzesidPlayerOpenCachedEntry(UzesidPlayer *pl, const UzesidUsdc *usdc, const UzesidUsdcEntry *entry, const UzesidSidSink *sink, u8 auto_loop)
-{
+int UzesidPlayerOpenCachedEntry(UzesidPlayer *pl, const UzesidUsdc *usdc, const UzesidUsdcEntry *entry, const UzesidSidSink *sink, u8 auto_loop){
 	UzesidUzsdStream stream;
 	if(pl == 0 || usdc == 0 || entry == 0 || sink == 0 || sink->write_reg == 0)
 		return -1;
@@ -774,8 +814,7 @@ int UzesidPlayerOpenCachedEntry(UzesidPlayer *pl, const UzesidUsdc *usdc, const 
 	return UzesidPlayerOpenStream(pl, &stream, entry, sink, auto_loop);
 }
 
-int UzesidPlayerOpenCachedByMd5(UzesidPlayer *pl, const UzesidUsdc *usdc, const u8 md5[16], u16 subtune_index, const UzesidSidSink *sink, u8 auto_loop)
-{
+int UzesidPlayerOpenCachedByMd5(UzesidPlayer *pl, const UzesidUsdc *usdc, const u8 md5[16], u16 subtune_index, const UzesidSidSink *sink, u8 auto_loop){
 	UzesidUsdcEntry entry;
 	if(pl == 0 || usdc == 0 || md5 == 0 || sink == 0)
 		return -1;
@@ -784,16 +823,14 @@ int UzesidPlayerOpenCachedByMd5(UzesidPlayer *pl, const UzesidUsdc *usdc, const 
 	return UzesidPlayerOpenCachedEntry(pl, usdc, &entry, sink, auto_loop);
 }
 
-void UzesidPlayerStop(UzesidPlayer *pl)
-{
+void UzesidPlayerStop(UzesidPlayer *pl){
 	if(pl == 0)
 		return;
 	pl->enabled = 0;
 }
 
 #if !defined(UZESID_DIRECT_SID_ONLY) || !(UZESID_DIRECT_SID_ONLY)
-static __attribute__((noinline)) int player_apply_generic_tick(UzesidPlayer *pl, u8 *ended_out)
-{
+static __attribute__((noinline)) int player_apply_generic_tick(UzesidPlayer *pl, u8 *ended_out){
 	UzesidUzsdTick tick;
 	u8 i;
 	int rc = UzesidUzsdNextTick(&pl->stream, &tick);
@@ -815,8 +852,7 @@ static __attribute__((noinline)) int player_apply_generic_tick(UzesidPlayer *pl,
 }
 #endif
 
-static int player_apply_one_tick(UzesidPlayer *pl)
-{
+static int player_apply_one_tick(UzesidPlayer *pl){
 	u8 ended = 0;
 	int rc;
 
@@ -860,8 +896,7 @@ static int player_apply_one_tick(UzesidPlayer *pl)
  * tunes can execute several play ticks per 60 Hz frame; rendering the
  * intervals between ticks preserves fast arpeggios and gate changes.  A
  * native-15 build still synthesizes both output samples in every pair. */
-static int player_advance_pairs(UzesidPlayer *pl, u8 *buf, u8 pairs)
-{
+static int player_advance_pairs(UzesidPlayer *pl, u8 *buf, u8 pairs){
 	int result = UZESID_PLAYER_FRAME_NO_TICK;
 
 	if(pl == 0)
@@ -878,61 +913,53 @@ static int player_advance_pairs(UzesidPlayer *pl, u8 *buf, u8 pairs)
 			if(rc == UZESID_PLAYER_FRAME_ERROR || rc == UZESID_PLAYER_FRAME_STOPPED)
 			{
 				if(buf != 0 && pairs != 0u)
-					SIDCalcBuffer(buf, (int)(pairs << 1));
+					calc_pairs(buf, pairs);
 				return rc;
 			}
 			result = rc;
 		}
+		u8 run = 0u;
+		do {
+			pl->tick_phase = (u16)(pl->tick_phase + pl->tick_hz);
+			run++;
+		} while(run < pairs && pl->tick_phase < UZESID_AUDIO_PAIR_RATE);
+		if(buf != 0)
 		{
-			u8 run = 0u;
-			do {
-				pl->tick_phase = (u16)(pl->tick_phase + pl->tick_hz);
-				run++;
-			} while(run < pairs && pl->tick_phase < UZESID_AUDIO_PAIR_RATE);
-			if(buf != 0)
-			{
-				SIDCalcBuffer(buf, (int)(run << 1));
-				buf += (u16)(run << 1);
-			}
-			pairs = (u8)(pairs - run);
+			calc_pairs(buf, run);
+			buf += (u16)(run << 1);
 		}
+		pairs = (u8)(pairs - run);
 	}
 	return result;
 }
 
-int UzesidPlayerStepVideoFrame(UzesidPlayer *pl)
-{
+int UzesidPlayerStepVideoFrame(UzesidPlayer *pl){
 	return player_advance_pairs(pl, 0, UZESID_AUDIO_PAIRS_PER_FRAME);
 }
 
 
 /* ---- sid sink ---- */
-void UzesidUzeSidSinkReset(void *user)
-{
+void UzesidUzeSidSinkReset(void *user){
 	(void)user;
 	SIDReset(0);
 }
 
-void UzesidUzeSidSinkBeginBatch(void *user)
-{
+void UzesidUzeSidSinkBeginBatch(void *user){
 	(void)user;
-	sid_begin_register_batch();
+	SIDBeginRegisterBatch();
 }
 
-void UzesidUzeSidSinkWriteReg(void *user, u8 reg, u8 val)
-{
+void UzesidUzeSidSinkWriteReg(void *user, u8 reg, u8 val){
 	(void)user;
-	SIDWriteRegister((int)reg, val);
+	SIDWriteRegister(reg, val);
 }
 
-void UzesidUzeSidSinkEndBatch(void *user)
-{
+void UzesidUzeSidSinkEndBatch(void *user){
 	(void)user;
-	sid_end_register_batch();
+	SIDEndRegisterBatch();
 }
 
-void UzesidUzeSidMakeSink(UzesidSidSink *sink, UzesidUzeSidSinkState *state)
-{
+void UzesidUzeSidMakeSink(UzesidSidSink *sink, UzesidUzeSidSinkState *state){
 	if(sink == 0) return;
 	sink->user = state;
 	sink->reset = UzesidUzeSidSinkReset;
@@ -983,14 +1010,14 @@ void UzesidUzeSidMakeSink(UzesidSidSink *sink, UzesidUzeSidSinkState *state)
 #define UZESID_SAVE_COMMIT_HEADER 4u
 #endif
 
-typedef enum UzeSidSource_e {
+typedef enum PlayerSource_e {
 	UZESID_SRC_NONE = 0,
 	UZESID_SRC_CACHE = 1,
 	UZESID_SRC_TEMP = 2
-} UzeSidSource;
+} PlayerSource;
 
 
-typedef struct UzeSidPlayerState_s {
+typedef struct PlayerState_s {
 	UzesidPffContext pff_ctx;
 	UzesidReader reader;
 	UzesidLidx lidx;
@@ -1009,9 +1036,9 @@ typedef struct UzeSidPlayerState_s {
 	u8 last_step;
 	u8 fast_forward;
 	u8 source;
-} UzeSidPlayerState;
+} PlayerState;
 
-static UzeSidPlayerState sp;
+static PlayerState sp;
 #if UZESID_ENABLE_CACHE_WRITE
 /* Reuse otherwise idle state bytes so cooperative cache saving adds no SRAM. */
 #define SP_SAVE_OFFSET (sp.lidx.header.build_unix_time)
@@ -1021,8 +1048,8 @@ static UzeSidPlayerState sp;
 
 /* The PSID loader reuses the existing USDC entry as its 124-byte header
  * scratch area. Fail at compile time if either structure later changes. */
-typedef char UzeSidPsidScratchFitsEntry[
-	(sizeof(((UzeSidPlayerState *)0)->entry) >= UZESID_PSID_SCRATCH_SIZE) ? 1 : -1];
+typedef char PsidScratchFitsEntry[
+	(sizeof(((PlayerState *)0)->entry) >= UZESID_PSID_SCRATCH_SIZE) ? 1 : -1];
 
 static u8 ptime_min;
 static u8 ptime_sec;
@@ -1066,28 +1093,28 @@ static void UpdateCursor(u8 ylimit);
 UZESID_NOINLINE static void PlayerInterface(void);
 UZESID_NOINLINE static void CacheSelectWindow(void);
 UZESID_NOINLINE static void RawSidSelectWindow(void);
-UZESID_NOINLINE static u8 UzeSidImportRawSid(const char *path, s16 requested_song);
+UZESID_NOINLINE static u8 ImportRawSid(const char *path, s16 requested_song);
 UZESID_NOINLINE static u8 ReadSidMetaTitle(const char *path, char *title);
-UZESID_NOINLINE static u8 UzeSidLoadEntryDirect(u32 entry_index, const UzesidUsdcEntry *entry, u8 source);
-static u8 UzeSidLoadTempCurrent(void);
-static u8 UzeSidCopyDbEntryToTemp(const UzesidUsdcEntry *entry);
+UZESID_NOINLINE static u8 LoadEntryDirect(u32 entry_index, const UzesidUsdcEntry *entry, u8 source);
+static u8 LoadTempCurrent(void);
+static u8 CopyDbEntryToTemp(const UzesidUsdcEntry *entry);
 #if UZESID_ENABLE_CACHE_WRITE
-static u8 UzeSidCacheSaveBegin(void);
-static void UzeSidCacheSavePump(void);
-static void UzeSidCacheSaveAbort(u8 error);
+static u8 CacheSaveBegin(void);
+static void CacheSavePump(void);
+static void CacheSaveAbort(u8 error);
 #endif
 static u8 ReopenDbFile(void);
 static void LoadPreferences(void);
 static void SavePreferences(void);
 static u8 ButtonHit(u8 x, u8 y, u8 w, u8 h);
 static void PollPad(void);
-static void UzeSidClearLoadedState(void);
-static void UzeSidSetNoSongLoaded(void);
-static u8 UzeSidEnsureDbOpen(void);
-static u8 UzeSidOpenDb(void);
-static void UzeSidBuildSongTitle(const UzesidUsdcEntry *entry);
-static void UzeSidPrintSongTitle(u8 x, u8 y, u8 len);
-static void UzeSidUpdateSongTitleScroll(void);
+static void ClearLoadedState(void);
+static void SetNoSongLoaded(void);
+static u8 EnsureDbOpen(void);
+static u8 OpenDb(void);
+static void BuildSongTitle(const UzesidUsdcEntry *entry);
+static void PrintSongTitle(u8 x, u8 y, u8 len);
+static void UpdateSongTitleScroll(void);
 static void SpiRamWriteStringEntry(u32 pos, const char *src);
 static void SpiRamReadStringEntry(u32 pos, char *dst);
 
@@ -1100,7 +1127,7 @@ typedef struct
 	char name[32];
 	u8 md5[16];
 	u8 subtunes;
-} UzeSidPrebuiltInfo;
+} PrebuiltInfo;
 
 #if !defined(UZESID_HOST_CONVERTER)
 #include "db-tool/prebuilt_sids.inc"
@@ -1114,8 +1141,7 @@ typedef struct
 #define UZESID_CARDLIST_MAX 0u
 #endif
 
-static u8 UzeSidFindPrebuilt(const char *name, u8 md5[16], u8 *subtunes)
-{
+static u8 FindPrebuilt(const char *name, u8 md5[16], u8 *subtunes){
 	u8 n;
 	if(name == 0 || md5 == 0 || subtunes == 0)
 		return 0;
@@ -1145,8 +1171,7 @@ static u8 UzeSidFindPrebuilt(const char *name, u8 md5[16], u8 *subtunes)
 }
 
 
-static u8 HasExt(const char *name, const char *ext)
-{
+static u8 HasExt(const char *name, const char *ext){
 	u8 i, j;
 	if(name == 0 || ext == 0)
 		return 0;
@@ -1166,8 +1191,7 @@ static u8 HasExt(const char *name, const char *ext)
 	return 1;
 }
 
-static u8 UzeSidStrLen(const char *s, u8 max_len)
-{
+static u8 StrLen(const char *s, u8 max_len){
 	u8 n = 0;
 	if(s == 0)
 		return 0;
@@ -1176,16 +1200,14 @@ static u8 UzeSidStrLen(const char *s, u8 max_len)
 	return n;
 }
 
-static void UzeSidTitleResetScroll(void)
-{
-	g_song_title_len = UzeSidStrLen(g_song_title, (u8)(SONG_TITLE_BUF_LEN - 1));
+static void TitleResetScroll(void){
+	g_song_title_len = StrLen(g_song_title, (u8)(SONG_TITLE_BUF_LEN - 1));
 	g_song_title_scroll = 0;
 	g_song_title_hold = SONG_TITLE_HOLD_START;
 	g_song_title_tick = 0;
 }
 
-static void UzeSidTitleSet(const char *s)
-{
+static void TitleSet(const char *s){
 	u8 i = 0;
 	if(s == 0)
 		s = "No song loaded";
@@ -1194,11 +1216,10 @@ static void UzeSidTitleSet(const char *s)
 		i++;
 	}
 	g_song_title[i] = 0;
-	UzeSidTitleResetScroll();
+	TitleResetScroll();
 }
 
-static void UzeSidTitleAppendChar(u8 *pos, char c)
-{
+static void TitleAppendChar(u8 *pos, char c){
 	if(*pos + 1 >= SONG_TITLE_BUF_LEN)
 		return;
 	g_song_title[*pos] = c;
@@ -1206,8 +1227,7 @@ static void UzeSidTitleAppendChar(u8 *pos, char c)
 	g_song_title[*pos] = 0;
 }
 
-static void UzeSidTitleAppendString(u8 *pos, const char *s, u8 max_len)
-{
+static void TitleAppendString(u8 *pos, const char *s, u8 max_len){
 	u8 i;
 	if(s == 0)
 		return;
@@ -1220,40 +1240,37 @@ static void UzeSidTitleAppendString(u8 *pos, const char *s, u8 max_len)
 	g_song_title[*pos] = 0;
 }
 
-static void UzeSidSetNoSongLoaded(void)
-{
-	UzeSidTitleSet("No song loaded");
+static void SetNoSongLoaded(void){
+	TitleSet("No song loaded");
 }
 
-static void UzeSidBuildSongTitle(const UzesidUsdcEntry *entry)
-{
+static void BuildSongTitle(const UzesidUsdcEntry *entry){
 	u8 pos = 0;
 	u8 have_author;
 	u8 have_year;
 	if(entry == 0 || entry->title[0] == 0){
-		UzeSidSetNoSongLoaded();
+		SetNoSongLoaded();
 		return;
 	}
 	g_song_title[0] = 0;
-	UzeSidTitleAppendString(&pos, entry->title, 32);
+	TitleAppendString(&pos, entry->title, 32);
 	have_author = (entry->author[0] != 0);
 	have_year = (entry->released[0] != 0);
 	if(have_author || have_year){
-		UzeSidTitleAppendString(&pos, " (", 2);
+		TitleAppendString(&pos, " (", 2);
 		if(have_author)
-			UzeSidTitleAppendString(&pos, entry->author, 32);
+			TitleAppendString(&pos, entry->author, 32);
 		if(have_year){
 			if(have_author)
-				UzeSidTitleAppendString(&pos, ", ", 2);
-			UzeSidTitleAppendString(&pos, entry->released, 16);
+				TitleAppendString(&pos, ", ", 2);
+			TitleAppendString(&pos, entry->released, 16);
 		}
-		UzeSidTitleAppendChar(&pos, ')');
+		TitleAppendChar(&pos, ')');
 	}
-	UzeSidTitleResetScroll();
+	TitleResetScroll();
 }
 
-static void UzeSidPrintSongTitle(u8 x, u8 y, u8 len)
-{
+static void PrintSongTitle(u8 x, u8 y, u8 len){
 	u8 i;
 	u8 cycle_len;
 	if(g_song_title_len == 0){
@@ -1282,8 +1299,7 @@ static void UzeSidPrintSongTitle(u8 x, u8 y, u8 len)
 	}
 }
 
-static void UzeSidUpdateSongTitleScroll(void)
-{
+static void UpdateSongTitleScroll(void){
 	u8 cycle_len;
 	if(g_song_title_len <= SONG_TITLE_VISIBLE_CHARS){
 		g_song_title_scroll = 0;
@@ -1307,8 +1323,7 @@ static void UzeSidUpdateSongTitleScroll(void)
 	}
 }
 
-static void SilenceBuffer(void)
-{
+static void SilenceBuffer(void){
 	u16 i;
 	for(i = 0; i < (u16)(UZESID_FRAME_SAMPLES * 2); i++)
 		mix_buf[i] = 0x80;
@@ -1317,8 +1332,7 @@ static void SilenceBuffer(void)
 /* Called by the blocking raw-SID loader.  Video continues to scan VRAM from
  * interrupts while the foreground code loads, so these stages identify the
  * exact operation without adding WaitVsync calls inside Petit FatFs access. */
-void UzeSidLoadProgress(u8 stage)
-{
+void LoadProgress(u8 stage){
 	SilenceBuffer();
 	switch(stage){
 		case 0: UMPrint(0, 1, PSTR("READING SID HEADER...         ")); break;
@@ -1333,8 +1347,7 @@ void UzeSidLoadProgress(u8 stage)
 	}
 }
 
-void UzeSidCaptureProgress(u32 captured_ticks, u32 total_ticks)
-{
+void CaptureProgress(u32 captured_ticks, u32 total_ticks){
 	u8 percent = 0;
 	/* Pre-emulation needs only one visible tile row.  Keeping the SPI usage
 	 * diagnostics off-screen saves eight rendered scanlines during capture. */
@@ -1344,15 +1357,13 @@ void UzeSidCaptureProgress(u32 captured_ticks, u32 total_ticks)
 	PrintByte(17, 0, percent, 0);
 }
 
-static void UzeSidResetClock(void)
-{
+static void ResetClock(void){
 	ptime_min = 0;
 	ptime_sec = 0;
 	ptime_frame = 0;
 }
 
-static void UzeSidAdvanceClock(void)
-{
+static void AdvanceClock(void){
 	if(++ptime_frame >= 60){
 		ptime_frame = 0;
 		if(++ptime_sec >= 60){
@@ -1363,17 +1374,15 @@ static void UzeSidAdvanceClock(void)
 	}
 }
 
-static void UzeSidApplyUiMetadata(const UzesidUsdcEntry *entry, u8 source)
-{
+static void ApplyUiMetadata(const UzesidUsdcEntry *entry, u8 source){
 	if(entry == 0)
 		return;
 	sp.entry = *entry;
 	sp.source = source;
-	UzeSidBuildSongTitle(entry);
+	BuildSongTitle(entry);
 }
 
-static void UzeSidBuildCurrentEntry(UzesidUsdcEntry *entry, const u8 md5[16])
-{
+static void BuildCurrentEntry(UzesidUsdcEntry *entry, const u8 md5[16]){
 	if(entry == 0)
 		return;
 
@@ -1402,8 +1411,7 @@ static void UzeSidBuildCurrentEntry(UzesidUsdcEntry *entry, const u8 md5[16])
 	entry->entry_crc = 0;
 }
 
-static void UzeSidRedrawShell(void)
-{
+static void RedrawShell(void){
 	ClearVram();
 	DrawMap(5, 0, (const char *)buttons_map);
 #if UZESID_ENABLE_CACHE_WRITE
@@ -1415,25 +1423,23 @@ static void UzeSidRedrawShell(void)
 		UMPrint(5, 2, PSTR("CACHE SAVE FAILED   "));
 	else
 #endif
-		UzeSidPrintSongTitle((CONT_BAR_X / 8), (CONT_BAR_Y / 8) + 2, SONG_TITLE_VISIBLE_CHARS);
+		PrintSongTitle((CONT_BAR_X / 8), (CONT_BAR_Y / 8) + 2, SONG_TITLE_VISIBLE_CHARS);
 	UMPrint(PTIME_X, PTIME_Y, PSTR("  :  :  "));
 	play_state |= PS_DRAWN;
 }
 
-static u8 UzeSidEnsureDbOpen(void)
-{
+static u8 EnsureDbOpen(void){
 	/* ReopenDbFile() may have selected UZESID.UZE after another Petit FatFs
 	 * file without decoding the database headers yet.  Do not treat the
 	 * active file alone as proof that LIDX/USDC state is initialized. */
 	if(sp.db_open && (sp.lidx_ok || sp.usdc_ok))
 		return 0;
-	if(UzeSidOpenDb() != 0)
+	if(OpenDb() != 0)
 		return 1;
 	return (!sp.lidx_ok && !sp.usdc_ok) ? 1 : 0;
 }
 
-static u8 UzeSidOpenDb(void)
-{
+static u8 OpenDb(void){
 	FRESULT res;
 	u8 rc;
 
@@ -1472,8 +1478,7 @@ static u8 UzeSidOpenDb(void)
 	return 0;
 }
 
-static u8 UzeSidReadLiveEntryByOrdinal(u16 ordinal, u32 *entry_index, UzesidUsdcEntry *entry)
-{
+static u8 ReadLiveEntryByOrdinal(u16 ordinal, u32 *entry_index, UzesidUsdcEntry *entry){
 	u32 i;
 	u16 live = 0;
 
@@ -1493,8 +1498,7 @@ static u8 UzeSidReadLiveEntryByOrdinal(u16 ordinal, u32 *entry_index, UzesidUsdc
 	}
 	return 1;
 }
-static u16 UzeSidGetLiveCount(void)
-{
+static u16 GetLiveCount(void){
 	if(!sp.usdc_ok)
 		return 0;
 	if(sp.usdc.header.live_entries > 65535UL)
@@ -1502,8 +1506,7 @@ static u16 UzeSidGetLiveCount(void)
 	return (u16)sp.usdc.header.live_entries;
 }
 
-static void UzeSidSpiWriteAt(u32 ofs, const u8 *src, u16 len)
-{
+static void SpiWriteAt(u32 ofs, const u8 *src, u16 len){
 	while(len != 0u){
 		u8 bank = (u8)(ofs >> 16);
 		u16 addr = (u16)ofs;
@@ -1521,8 +1524,7 @@ static void UzeSidSpiWriteAt(u32 ofs, const u8 *src, u16 len)
 	}
 }
 
-static u8 UzeSidCopyDbEntryToTemp(const UzesidUsdcEntry *entry)
-{
+static u8 CopyDbEntryToTemp(const UzesidUsdcEntry *entry){
 	u32 offset = 0;
 	u32 capacity;
 	u32 file_offset;
@@ -1559,7 +1561,7 @@ static u8 UzeSidCopyDbEntryToTemp(const UzesidUsdcEntry *entry)
 		if(pf_read(g_uzesid_workbuf, chunk, &br) != FR_OK || br != chunk)
 			return 5;
 		while(rcv_spi() != 0xFF);
-		UzeSidSpiWriteAt(UZESID_TEMP_SPI_OFS + offset, g_uzesid_workbuf, chunk);
+		SpiWriteAt(UZESID_TEMP_SPI_OFS + offset, g_uzesid_workbuf, chunk);
 		offset += chunk;
 		if((offset & 0x3fffUL) == 0u || offset == entry->usd_size){
 			PrintLong(8, 1, offset >> 10);
@@ -1569,29 +1571,27 @@ static u8 UzeSidCopyDbEntryToTemp(const UzesidUsdcEntry *entry)
 	return 0;
 }
 
-UZESID_NOINLINE static u8 UzeSidLoadEntryDirect(u32 entry_index, const UzesidUsdcEntry *entry, u8 source)
-{
+UZESID_NOINLINE static u8 LoadEntryDirect(u32 entry_index, const UzesidUsdcEntry *entry, u8 source){
 	if(entry == 0)
 		return 1;
 	/* entry normally points at the global sp.entry.  Keeping a second 128-byte
 	 * copy on the AVR stack during SD and SPI calls needlessly reduced the
 	 * interrupt margin and could corrupt VRAM on deep Petit FatFs paths. */
-	if(UzeSidCopyDbEntryToTemp(entry) != 0)
+	if(CopyDbEntryToTemp(entry) != 0)
 		return 2;
 	if(UzesidPlayerOpenSpiTemp(&sp.player, UZESID_TEMP_SPI_OFS, entry->usd_size,
 			entry, &sp.sink, 1) != 0)
 		return 3;
 	sp.current_index = entry_index;
 	sp.loaded = 1;
-	UzeSidApplyUiMetadata(entry, source);
-	UzeSidResetClock();
+	ApplyUiMetadata(entry, source);
+	ResetClock();
 	play_state = PS_LOADED | PS_PLAYING;
 	sp.redraw = 1;
 	return 0;
 }
 
-static u8 UzeSidMd5Present(const u8 md5[16])
-{
+static u8 Md5Present(const u8 md5[16]){
 	u8 i;
 	for(i = 0; i < 16u; i++)
 		if(md5[i] != 0u)
@@ -1600,8 +1600,7 @@ static u8 UzeSidMd5Present(const u8 md5[16])
 }
 
 #if UZESID_ENABLE_CACHE_WRITE
-static void UzeSidCacheSaveAbort(u8 error)
-{
+static void CacheSaveAbort(u8 error){
 	SP_SAVE_STATE = UZESID_SAVE_IDLE;
 	/* A failed CMD24 initiation can leave the card selected because Petit
 	 * FatFs aborts before its normal finalize call.  Always release CS and
@@ -1612,19 +1611,18 @@ static void UzeSidCacheSaveAbort(u8 error)
 	sp.lidx_ok = 0;
 	sp.usdc_ok = 0;
 	if(pf_mount(&fs) == FR_OK)
-		(void)UzeSidOpenDb();
+		(void)OpenDb();
 	SP_SAVE_ERROR = error;
 	sp.redraw = 1;
 }
 
-UZESID_NOINLINE static u8 UzeSidCacheSaveBegin(void)
-{
+UZESID_NOINLINE static u8 CacheSaveBegin(void){
 	u32 entry_index;
 	u32 block_count;
 
 	SP_SAVE_STATE = UZESID_SAVE_IDLE;
 	SP_SAVE_ERROR = 0;
-	if(sp.entry.usd_size < UZESID_UZSD_HEADER_SIZE || !UzeSidMd5Present(sp.entry.md5))
+	if(sp.entry.usd_size < UZESID_UZSD_HEADER_SIZE || !Md5Present(sp.entry.md5))
 		return 1;
 	if(ReopenDbFile() != 0 || !sp.usdc_ok)
 		return 2;
@@ -1648,8 +1646,7 @@ UZESID_NOINLINE static u8 UzeSidCacheSaveBegin(void)
 	return 0;
 }
 
-UZESID_NOINLINE static void UzeSidCacheSavePump(void)
-{
+UZESID_NOINLINE static void CacheSavePump(void){
 	u8 rc;
 	if(SP_SAVE_STATE == UZESID_SAVE_IDLE)
 		return;
@@ -1659,7 +1656,7 @@ UZESID_NOINLINE static void UzeSidCacheSavePump(void)
 			512u : (sp.entry.usd_size - SP_SAVE_OFFSET));
 		if(UzesidSpiReadAt(0, UZESID_TEMP_SPI_OFS + SP_SAVE_OFFSET,
 				g_uzesid_workbuf, valid) != 0){
-			UzeSidCacheSaveAbort(5);
+			CacheSaveAbort(5);
 			return;
 		}
 		if(valid < 512u)
@@ -1667,7 +1664,7 @@ UZESID_NOINLINE static void UzeSidCacheSavePump(void)
 		rc = UzesidUsdcWriteData(&sp.usdc, sp.entry.first_block,
 			SP_SAVE_OFFSET, g_uzesid_workbuf, 512);
 		if(rc != 0){
-			UzeSidCacheSaveAbort(6);
+			CacheSaveAbort(6);
 			return;
 		}
 		SP_SAVE_OFFSET += valid;
@@ -1678,13 +1675,13 @@ UZESID_NOINLINE static void UzeSidCacheSavePump(void)
 
 	if(SP_SAVE_STATE == UZESID_SAVE_COMMIT_BLOCKS){
 		rc = UzesidUsdcCommitBlocks(&sp.usdc, sp.entry.first_block, sp.entry.block_count);
-		if(rc != 0){ UzeSidCacheSaveAbort(7); return; }
+		if(rc != 0){ CacheSaveAbort(7); return; }
 		SP_SAVE_STATE = UZESID_SAVE_COMMIT_ENTRY;
 		return;
 	}
 	if(SP_SAVE_STATE == UZESID_SAVE_COMMIT_ENTRY){
 		rc = UzesidUsdcWriteEntry(&sp.usdc, sp.current_index, &sp.entry);
-		if(rc != 0){ UzeSidCacheSaveAbort(8); return; }
+		if(rc != 0){ CacheSaveAbort(8); return; }
 		SP_SAVE_STATE = UZESID_SAVE_COMMIT_HEADER;
 		return;
 	}
@@ -1693,7 +1690,7 @@ UZESID_NOINLINE static void UzeSidCacheSavePump(void)
 		rc = UzesidUsdcWriteHeader(&sp.usdc);
 		if(rc != 0){
 			sp.usdc.header.live_entries--;
-			UzeSidCacheSaveAbort(9);
+			CacheSaveAbort(9);
 			return;
 		}
 		SP_SAVE_STATE = UZESID_SAVE_IDLE;
@@ -1703,16 +1700,15 @@ UZESID_NOINLINE static void UzeSidCacheSavePump(void)
 }
 #endif
 
-static u8 UzeSidLoadTempCurrent(void)
-{
+static u8 LoadTempCurrent(void){
 	u32 total_size;
 	u32 song_length_ms;
 	u32 capacity;
 	u16 tick_hz;
 	u8 rc;
 
-	UzeSidBuildCurrentEntry(&sp.entry, sp.entry.md5);
-	if(sp.lidx_ok && UzeSidMd5Present(sp.entry.md5)){
+	BuildCurrentEntry(&sp.entry, sp.entry.md5);
+	if(sp.lidx_ok && Md5Present(sp.entry.md5)){
 		rc = UzesidLidxGetLengthMs(&sp.lidx, sp.entry.md5,
 			(u16)current_song, &song_length_ms);
 		if(rc != 0)
@@ -1724,7 +1720,7 @@ static u8 UzeSidLoadTempCurrent(void)
 		return 1;
 	capacity = g_detected_ram - UZESID_TEMP_SPI_OFS;
 	SetRenderingParameters(33, 8);
-	UzeSidLoadProgress(5);
+	LoadProgress(5);
 	if(!UzesidCaptureCurrentSongToSpi(UZESID_TEMP_SPI_OFS, capacity,
 			song_length_ms, &total_size, &sp.entry.length_ms, &tick_hz))
 		return 1;
@@ -1740,34 +1736,32 @@ static u8 UzeSidLoadTempCurrent(void)
 	/* Keep raw-SID context after capture/writeback so Previous/Next continues
 	 * to select subtunes.  Loading the same raw SID after reboot can still use
 	 * its persistent stream without changing that navigation behavior. */
-	UzeSidApplyUiMetadata(&sp.entry, UZESID_SRC_TEMP);
+	ApplyUiMetadata(&sp.entry, UZESID_SRC_TEMP);
 
 #if UZESID_ENABLE_CACHE_WRITE
-	{
-		u8 save_rc = UzeSidCacheSaveBegin();
-		if(save_rc != 0){
-			SP_SAVE_ERROR = save_rc;
-			sp.redraw = 1;
-		}else if(SP_SAVE_STATE != UZESID_SAVE_IDLE){
-			u8 shown = 0xffu;
-			/* Cache writeback owns the foreground until every data block and
-			 * directory/header commit is complete.  The mixer keeps consuming
-			 * silence, so a newly captured song cannot start and stutter while
-			 * the SD card is still being updated. */
-			SilenceBuffer();
-			UMPrint(0, 0, PSTR("SAVING CACHE      %             "));
-			while(SP_SAVE_STATE != UZESID_SAVE_IDLE){
-				u8 percent;
-				UzeSidCacheSavePump();
-				if(SP_SAVE_STATE == UZESID_SAVE_DATA && sp.entry.usd_size != 0u)
-					percent = (u8)((SP_SAVE_OFFSET * 100UL) / sp.entry.usd_size);
-				else
-					percent = 100u;
-				if(percent != shown){
-					shown = percent;
-					PrintByte(15, 0, percent, 0);
-					WaitVsync(1);
-				}
+	u8 save_rc = CacheSaveBegin();
+	if(save_rc != 0){
+		SP_SAVE_ERROR = save_rc;
+		sp.redraw = 1;
+	}else if(SP_SAVE_STATE != UZESID_SAVE_IDLE){
+		u8 shown = 0xffu;
+		/* Cache writeback owns the foreground until every data block and
+		 * directory/header commit is complete.  The mixer keeps consuming
+		 * silence, so a newly captured song cannot start and stutter while
+		 * the SD card is still being updated. */
+		SilenceBuffer();
+		UMPrint(0, 0, PSTR("SAVING CACHE      %             "));
+		while(SP_SAVE_STATE != UZESID_SAVE_IDLE){
+			u8 percent;
+			CacheSavePump();
+			if(SP_SAVE_STATE == UZESID_SAVE_DATA && sp.entry.usd_size != 0u)
+				percent = (u8)((SP_SAVE_OFFSET * 100UL) / sp.entry.usd_size);
+			else
+				percent = 100u;
+			if(percent != shown){
+				shown = percent;
+				PrintByte(15, 0, percent, 0);
+				WaitVsync(1);
 			}
 		}
 	}
@@ -1776,10 +1770,10 @@ static u8 UzeSidLoadTempCurrent(void)
 	 * (or failed cleanly).  The first generated audio frame therefore belongs
 	 * to a fully loaded, stable stream. */
 	sp.loaded = 1;
-	UzeSidResetClock();
+	ResetClock();
 	play_state = PS_LOADED | PS_PLAYING;
 	sp.redraw = 1;
-	UzeSidLoadProgress(6);
+	LoadProgress(6);
 	if(sp.entry.flags & UZESID_UZSD_FLAG_TRUNCATED){
 		UMPrint(0, 2, PSTR("SPI RAM FULL; CAPTURE WILL LOOP"));
 		WaitVsync(30);
@@ -1787,16 +1781,14 @@ static u8 UzeSidLoadTempCurrent(void)
 	return 0;
 }
 
-static u8 UzeSidLoadEntryByOrdinal(u16 ordinal)
-{
+static u8 LoadEntryByOrdinal(u16 ordinal){
 	u32 entry_index;
 
-	if(UzeSidReadLiveEntryByOrdinal(ordinal, &entry_index, &sp.entry) != 0)
+	if(ReadLiveEntryByOrdinal(ordinal, &entry_index, &sp.entry) != 0)
 		return 1;
-	return UzeSidLoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_CACHE);
+	return LoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_CACHE);
 }
-static u8 UzeSidFindOrdinalByEntryIndex(u32 entry_index, u16 *ordinal_out)
-{
+static u8 FindOrdinalByEntryIndex(u32 entry_index, u16 *ordinal_out){
 	u32 i;
 	u16 live = 0;
 
@@ -1816,19 +1808,17 @@ static u8 UzeSidFindOrdinalByEntryIndex(u32 entry_index, u16 *ordinal_out)
 	}
 	return 1;
 }
-static void RestartSID(void)
-{
+static void RestartSID(void){
 	if(!sp.loaded)
 		return;
 	if(UzesidPlayerRestart(&sp.player) == 0){
 		play_state = PS_LOADED | PS_PLAYING;
-		UzeSidResetClock();
+		ResetClock();
 		sp.redraw = 1;
 	}
 }
 
-static void UzeSidRenderAudioFrame(void)
-{
+static void RenderAudioFrame(void){
 	u8 *buf;
 	/* Generate into shared staging SRAM first.  The player applies CIA ticks at
 	 * their sub-frame sample positions, then the complete frame is published to
@@ -1839,8 +1829,7 @@ static void UzeSidRenderAudioFrame(void)
 	memcpy(buf, sid_frame_staging, UZESID_FRAME_SAMPLES);
 }
 
-UZESID_NOINLINE static void RenderSID(void)
-{
+UZESID_NOINLINE static void RenderSID(void){
 	static u8 timer_draw_div;
 	u8 ff;
 	u8 playing;
@@ -1851,36 +1840,45 @@ UZESID_NOINLINE static void RenderSID(void)
 
 	/* WaitVsync() returns at the start of the frame.  Produce audio immediately,
 	 * before polling input or touching VRAM, so synthesis receives the complete
-	 * frame budget.  Keep the normal 24-line display enabled throughout; the old
-	 * temporary one-line mode was directly visible whenever work crossed vsync
-	 * and was the source of the severe player-screen flicker. */
+	 * frame budget.  Native mode may temporarily reduce active video work during
+	 * synthesis, but interface processing itself still runs every frame. */
 	if(playing){
+#if UZESID_SYNTH_DUP == 1u
+		/* Keep the GUI state updated every frame, but temporarily reduce active
+		 * video work while native synthesis owns the CPU.  The compile-time line
+		 * count trades catch-up margin against visible flicker; the full player
+		 * display is restored before interface work is performed. */
+		SetRenderingParameters(33, UZESID_NATIVE_RENDER_LINES);
+#endif
 		ff = sp.fast_forward;
 		while(ff-- != 0u){
 			(void)UzesidPlayerStepVideoFrame(&sp.player);
-			UzeSidAdvanceClock();
+			AdvanceClock();
 		}
-		UzeSidAdvanceClock();
-		UzeSidRenderAudioFrame();
+		AdvanceClock();
+		RenderAudioFrame();
+#if UZESID_SYNTH_DUP == 1u
+		SetRenderingParameters(33, 24);
+#endif
 	}else{
 		/* Match UzeMOD: the kernel keeps consuming the silent ring while idle. */
 		SilenceBuffer();
 	}
 
-	/* Controls and GUI work are deliberately one frame behind audio.  That is
-	 * imperceptible to input but prevents cursor/text work from stealing the
-	 * mixer deadline. */
+	/* Keep input, cursor movement, button feedback, title scrolling, and shell
+	 * redraws running every video frame. Audio is still generated first, but a
+	 * difficult register frame no longer makes the interface visibly stutter. */
 	PlayerInterface();
 
 	if(!(play_state & PS_DRAWN) || sp.redraw){
-		UzeSidRedrawShell();
+		RedrawShell();
 		sp.redraw = 0;
 		shell_redrawn = 1u;
 	}else{
 		u8 prev_scroll = g_song_title_scroll;
-		UzeSidUpdateSongTitleScroll();
+		UpdateSongTitleScroll();
 		if(g_song_title_scroll != prev_scroll)
-			UzeSidPrintSongTitle((CONT_BAR_X / 8), (CONT_BAR_Y / 8) + 2, SONG_TITLE_VISIBLE_CHARS);
+			PrintSongTitle((CONT_BAR_X / 8), (CONT_BAR_Y / 8) + 2, SONG_TITLE_VISIBLE_CHARS);
 	}
 
 	/* Text conversion and VRAM writes are unnecessary at 60 Hz.  Ten updates
@@ -1901,8 +1899,7 @@ UZESID_NOINLINE static void RenderSID(void)
 }
 
 
-static void UzeSidBrowserInvertRow(u8 y, u8 invert)
-{
+static void BrowserInvertRow(u8 y, u8 invert){
 	u8 x;
 	u16 base = (u16)y * VRAM_TILES_H;
 	for(x = 5; x < 26; x++){
@@ -1916,8 +1913,7 @@ static void UzeSidBrowserInvertRow(u8 y, u8 invert)
 	}
 }
 
-static u32 UzeSidCacheBrowserReadRow(u8 row, char **title_out)
-{
+static u32 CacheBrowserReadRow(u8 row, char **title_out){
 	u32 ofs = UZESID_CACHE_BROWSER_BASE +
 		(u32)row * UZESID_CACHE_BROWSER_RECORD_SIZE;
 	SpiRamReadInto((u8)(ofs >> 16), (u16)ofs,
@@ -1932,8 +1928,7 @@ static u32 UzeSidCacheBrowserReadRow(u8 row, char **title_out)
  * rescanned from directory entry zero for every row on every video frame;
  * with a populated database that could issue dozens of SD seeks per frame,
  * leaving only the first COMMANDO row visible and causing severe flicker. */
-UZESID_NOINLINE static u8 UzeSidCacheBrowserLoadPage(u16 first_song, u16 *total_out, u8 count_all)
-{
+UZESID_NOINLINE static u8 CacheBrowserLoadPage(u16 first_song, u16 *total_out, u8 count_all){
 	u32 i;
 	u32 dir_abs;
 	u16 song_ordinal = 0;
@@ -1987,8 +1982,7 @@ UZESID_NOINLINE static u8 UzeSidCacheBrowserLoadPage(u16 first_song, u16 *total_
 	return rows;
 }
 
-static void UzeSidCacheBrowserDrawPage(u16 foff, u16 total, u8 rows)
-{
+static void CacheBrowserDrawPage(u16 foff, u16 total, u8 rows){
 	u8 i;
 	char *title;
 	DrawWindow(4, 2, 22, SCREEN_TILES_V - 3,
@@ -2000,7 +1994,7 @@ static void UzeSidCacheBrowserDrawPage(u16 foff, u16 total, u8 rows)
 	SetTile(26, SCREEN_TILES_V - 1, TILE_WIN_SCRD);
 	for(i = 0; i < UZESID_LIST_ROWS; i++){
 		if(i < rows){
-			(void)UzeSidCacheBrowserReadRow(i, &title);
+			(void)CacheBrowserReadRow(i, &title);
 			UMPrintRamClip(5, 4 + i, title, UZESID_BROWSER_LIST_WIDTH);
 		}else{
 			UMPrintRamClip(5, 4 + i, "", UZESID_BROWSER_LIST_WIDTH);
@@ -2008,14 +2002,13 @@ static void UzeSidCacheBrowserDrawPage(u16 foff, u16 total, u8 rows)
 	}
 }
 
-UZESID_NOINLINE static void CacheSelectWindow(void)
-{
+UZESID_NOINLINE static void CacheSelectWindow(void){
 	u16 foff = 0;
 	u16 total = 0;
 	u8 rows;
 	u8 last_row = 0xffu;
 
-	if(UzeSidEnsureDbOpen() != 0 || !sp.usdc_ok)
+	if(EnsureDbOpen() != 0 || !sp.usdc_ok)
 		return;
 
 	SilenceBuffer();
@@ -2025,14 +2018,14 @@ UZESID_NOINLINE static void CacheSelectWindow(void)
 	WaitVsync(1);
 	/* The initial sequential directory pass both counts distinct SIDs and
 	 * fills the first visible page.  Later page changes stop after ten rows. */
-	rows = UzeSidCacheBrowserLoadPage(foff, &total, 1u);
+	rows = CacheBrowserLoadPage(foff, &total, 1u);
 	if(total == 0u){
 		ReopenDbFile();
 		SetRenderingParameters(33, 24);
 		return;
 	}
 	ClearVram();
-	UzeSidCacheBrowserDrawPage(foff, total, rows);
+	CacheBrowserDrawPage(foff, total, rows);
 
 	while(1){
 		u8 line;
@@ -2050,15 +2043,15 @@ UZESID_NOINLINE static void CacheSelectWindow(void)
 		if(row != last_row){
 			char *title;
 			if(last_row != 0xffu)
-				UzeSidBrowserInvertRow((u8)(4u + last_row), 0);
+				BrowserInvertRow((u8)(4u + last_row), 0);
 			last_row = row;
 			UMPrint(0, 0, PSTR("Title:                         "));
 			UMPrint(0, 1, PSTR("                              "));
 			UMPrint(0, 2, PSTR("                              "));
 			if(row != 0xffu){
-				(void)UzeSidCacheBrowserReadRow(row, &title);
+				(void)CacheBrowserReadRow(row, &title);
 				UMPrintRamClip(7, 0, title, UZESID_BROWSER_PREVIEW_WIDTH);
-				UzeSidBrowserInvertRow((u8)(4u + row), 1);
+				BrowserInvertRow((u8)(4u + row), 1);
 				PrintInt(16, SCREEN_TILES_V - 1,
 					(u16)(foff + row + 1u), 1);
 			}else{
@@ -2076,20 +2069,20 @@ UZESID_NOINLINE static void CacheSelectWindow(void)
 				if(next != foff){
 					foff = next;
 					last_row = 0xffu;
-					rows = UzeSidCacheBrowserLoadPage(foff, 0, 0u);
-					UzeSidCacheBrowserDrawPage(foff, total, rows);
+					rows = CacheBrowserLoadPage(foff, 0, 0u);
+					CacheBrowserDrawPage(foff, total, rows);
 				}
 			}else if(ButtonHit(26, SCREEN_TILES_V - 1, 1, 1)){
 				if((u16)(foff + UZESID_LIST_ROWS) < total){
 					foff = (u16)(foff + UZESID_LIST_ROWS);
 					last_row = 0xffu;
-					rows = UzeSidCacheBrowserLoadPage(foff, 0, 0u);
-					UzeSidCacheBrowserDrawPage(foff, total, rows);
+					rows = CacheBrowserLoadPage(foff, 0, 0u);
+					CacheBrowserDrawPage(foff, total, rows);
 				}
 			}else if(row != 0xffu && ButtonHit(5, 4, 20, UZESID_LIST_ROWS)){
-				u32 entry_index = UzeSidCacheBrowserReadRow(row, 0);
+				u32 entry_index = CacheBrowserReadRow(row, 0);
 				if(UzesidUsdcReadEntry(&sp.usdc, entry_index, &sp.entry) == 0)
-					(void)UzeSidLoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_CACHE);
+					(void)LoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_CACHE);
 				break;
 			}
 		}
@@ -2104,8 +2097,7 @@ UZESID_NOINLINE static void CacheSelectWindow(void)
 	WaitVsync(1);
 }
 
-static u8 UzeSidLoadAdjacent(s8 dir)
-{
+static u8 LoadAdjacent(s8 dir){
 	u16 total;
 	u16 ord;
 	if(!sp.loaded)
@@ -2129,22 +2121,21 @@ static u8 UzeSidLoadAdjacent(s8 dir)
 			return 1;
 		UMPrint(0, 1, PSTR("Loading subtune...            "));
 		WaitVsync(1);
-		return UzeSidImportRawSid(path, target);
+		return ImportRawSid(path, target);
 	}
-	total = UzeSidGetLiveCount();
+	total = GetLiveCount();
 	if(total == 0)
 		return 1;
-	if(UzeSidFindOrdinalByEntryIndex(sp.current_index, &ord) != 0)
+	if(FindOrdinalByEntryIndex(sp.current_index, &ord) != 0)
 		return 1;
 	if(dir < 0)
 		ord = (ord == 0) ? (u16)(total - 1) : (u16)(ord - 1);
 	else
 		ord = (u16)((ord + 1 >= total) ? 0 : (ord + 1));
-	return UzeSidLoadEntryByOrdinal(ord);
+	return LoadEntryByOrdinal(ord);
 }
 
-int main(void)
-{
+int main(void){
 	FRESULT res = FR_OK;
 	u8 i;
 	u8 bank_count;
@@ -2204,8 +2195,7 @@ int main(void)
 	memset(&sp, 0, sizeof(sp));
 	sp.current_index = UZESID_INVALID_INDEX;
 	UzesidUzeSidMakeSink(&sp.sink, &sp.sink_state);
-	UzeSidClearLoadedState();
-	UMPrint(3, 4, PSTR("DB deferred"));
+	ClearLoadedState();
 	WaitVsync(20);
 
 	sprites[0].tileIndex = TILE_CURSOR;
@@ -2217,6 +2207,13 @@ int main(void)
 	while(1){
 		WaitVsync(1);
 		RenderSID();
+
+		/* Use time that would otherwise be spent inside the next WaitVsync() to
+		 * top up the compact-stream read-ahead window.  Register-heavy frames then
+		 * avoid an SPI burst in the middle of sample generation. */
+		if(!GetVsyncFlag() && sp.loaded &&
+			((play_state & (PS_PLAYING | PS_PAUSE)) == PS_PLAYING))
+			UzesidUzsdIdlePrefetch(&sp.player.stream);
 	}
 
 MAIN_FAIL:
@@ -2225,8 +2222,7 @@ MAIN_FAIL:
 	return 0;
 }
 
-static void PollPad(void)
-{
+static void PollPad(void){
 	u16 pad2;
 	InputDeviceHandler();
 	oldpad = pad;
@@ -2239,19 +2235,17 @@ static void PollPad(void)
 		pad |= pad2 & (BTN_MOUSE_LEFT | BTN_MOUSE_RIGHT);
 }
 
-static void UzeSidClearLoadedState(void)
-{
+static void ClearLoadedState(void){
 	sp.loaded = 0;
 	sp.source = UZESID_SRC_NONE;
 	sp.current_index = UZESID_INVALID_INDEX;
 	memset(&sp.entry, 0, sizeof(sp.entry));
-	UzeSidSetNoSongLoaded();
+	SetNoSongLoaded();
 	play_state = 0;
 	sp.redraw = 1;
 }
 
-static void InputDeviceHandler(void)
-{
+static void InputDeviceHandler(void){
 	u8 i;
 	joypad1_status_lo = joypad2_status_lo = joypad1_status_hi = joypad2_status_hi = 0;
 
@@ -2299,8 +2293,7 @@ static void InputDeviceHandler(void)
 	}
 }
 
-static void DrawWindow(u8 x, u8 y, u8 w, u8 h, const char *title, const char *lb, const char *rb)
-{
+static void DrawWindow(u8 x, u8 y, u8 w, u8 h, const char *title, const char *lb, const char *rb){
 	u8 x2, y2;
 	SetTile(x + 0, y + 0, TILE_WIN_TLC);
 	SetTile(x + w, y + 0, TILE_WIN_TRC);
@@ -2333,8 +2326,7 @@ static void DrawWindow(u8 x, u8 y, u8 w, u8 h, const char *title, const char *lb
 	}
 }
 
-static void UpdateCursor(u8 ylimit)
-{
+static void UpdateCursor(u8 ylimit){
 	u8 speed;
 	PollPad();
 	speed = (pad & BTN_SR) ? 1 : 2;
@@ -2377,8 +2369,6 @@ static void UpdateCursor(u8 ylimit)
 		motion = (i == 0) ? joypad1_status_hi : joypad2_status_hi;
 		deltax = motion & 0x007f;
 		deltay = (motion >> 8) & 0x007f;
-		/* SNES mouse byte layout: X sign is bit 7 and Y sign is bit 15.
-		 * The old UzeSID code had these two sign bits reversed. */
 		if(motion & 0x0080)
 			deltax = -deltax;
 		if(motion & 0x8000)
@@ -2400,8 +2390,7 @@ static void UpdateCursor(u8 ylimit)
 	}
 }
 
-UZESID_NOINLINE static void PlayerInterface(void)
-{
+UZESID_NOINLINE static void PlayerInterface(void){
 	static u8 lastbtn = 255;
 	u8 btn;
 	u8 newclick = 0;
@@ -2449,7 +2438,7 @@ UZESID_NOINLINE static void PlayerInterface(void)
 	if(newclick){
 		if(play_state & PS_LOADED){
 			if(btn == 0){
-				(void)UzeSidLoadAdjacent(-1);
+				(void)LoadAdjacent(-1);
 			}else if(btn == 1){
 				RestartSID();
 			}else if(btn == 2){
@@ -2460,12 +2449,12 @@ UZESID_NOINLINE static void PlayerInterface(void)
 			}else if(btn == 3 || btn == 4){
 				play_state = PS_LOADED | PS_DRAWN | PS_PLAYING;
 			}else if(btn == 5){
-				(void)UzeSidLoadAdjacent(1);
+				(void)LoadAdjacent(1);
 			}
 		}
 		if(btn == 6 || btn == 7){
 			if(btn == 6 && g_detected_ram < UZESID_RAW_REQUIRED_RAM){
-				UzeSidTitleSet("Raw SID needs 128K SPI RAM");
+				TitleSet("Raw SID needs 128K SPI RAM");
 			}else{
 				WaitVsync(1);
 				if(btn == 6)
@@ -2504,15 +2493,13 @@ UZESID_NOINLINE static void PlayerInterface(void)
 }
 
 
-static u8 ButtonHit(u8 x, u8 y, u8 w, u8 h)
-{
+static u8 ButtonHit(u8 x, u8 y, u8 w, u8 h){
 	if(sprites[0].x < (x << 3) || sprites[0].x >= (x << 3) + (w << 3) || sprites[0].y < (y << 3) || sprites[0].y >= (y << 3) + (h << 3))
 		return 0;
 	return 1;
 }
 
-static void LoadPreferences(void)
-{
+static void LoadPreferences(void){
 	struct EepromBlockStruct ebs;
 	ebs.id = UZENET_EEPROM_ID1;
 	if(EepromReadBlock(ebs.id, &ebs) == 0){
@@ -2528,8 +2515,7 @@ static void LoadPreferences(void)
 	}
 }
 
-static void SavePreferences(void)
-{
+static void SavePreferences(void){
 	struct EepromBlockStruct ebs;
 	ebs.id = UZENET_EEPROM_ID1;
 	if(EepromReadBlock(ebs.id, &ebs)){
@@ -2542,8 +2528,7 @@ static void SavePreferences(void)
 	EepromWriteBlock(&ebs);
 }
 
-static void UMPrintChar(u8 x, u8 y, char c)
-{
+static void UMPrintChar(u8 x, u8 y, char c){
 	u8 uc = (u8)c;
 	if(uc >= 'a' && uc <= 'z')
 		uc -= 32;
@@ -2552,8 +2537,7 @@ static void UMPrintChar(u8 x, u8 y, char c)
 	SetTile(x, y, (u8)(uc - 32));
 }
 
-static void UMPrint(u8 x, u8 y, const char *s)
-{
+static void UMPrint(u8 x, u8 y, const char *s){
 	u8 soff = 0;
 	do{
 		char c = pgm_read_byte(&s[soff++]);
@@ -2563,8 +2547,7 @@ static void UMPrint(u8 x, u8 y, const char *s)
 	}while(1);
 }
 
-static void UMPrintRamClip(u8 x, u8 y, const char *s, u8 width)
-{
+static void UMPrintRamClip(u8 x, u8 y, const char *s, u8 width){
 	u8 i = 0;
 	while(i < width && *s){
 		UMPrintChar(x + i, y, *s++);
@@ -2578,8 +2561,7 @@ static void UMPrintRamClip(u8 x, u8 y, const char *s, u8 width)
 
 /* ---- raw SID import helpers (root directory only, first pass) ---- */
 
-static void SpiRamWriteStringEntry(u32 pos, const char *s)
-{
+static void SpiRamWriteStringEntry(u32 pos, const char *s){
 	u8 i = 0;
 	/* Use the bounded block API instead of opening a hand-written sequential
 	 * transaction immediately after a Petit FatFs directory operation.  This
@@ -2594,14 +2576,12 @@ static void SpiRamWriteStringEntry(u32 pos, const char *s)
 	SpiRamWriteFrom((u8)(pos >> 16), (u16)pos, g_uzesid_workbuf, 32);
 }
 
-static void SpiRamReadStringEntry(u32 pos, char *dst)
-{
+static void SpiRamReadStringEntry(u32 pos, char *dst){
 	SpiRamReadInto((u8)(pos >> 16), (u16)(pos & 0xffffu), dst, 32);
 	dst[31] = 0;
 }
 
-UZESID_NOINLINE static u16 LoadRootSidList(void)
-{
+UZESID_NOINLINE static u16 LoadRootSidList(void){
 	DIR dir;
 	FILINFO fno;
 	FRESULT res;
@@ -2619,11 +2599,9 @@ UZESID_NOINLINE static u16 LoadRootSidList(void)
 				continue;
 			/* A same-named embedded SID is represented by the DB row appended
 			 * below, avoiding duplicate card/cache entries in the merged list. */
-			{
-				u8 subtunes;
-				if(UzeSidFindPrebuilt(fno.fname, g_uzesid_workbuf, &subtunes))
-					continue;
-			}
+			u8 subtunes;
+			if(FindPrebuilt(fno.fname, g_uzesid_workbuf, &subtunes))
+				continue;
 			SpiRamWriteStringEntry(UZESID_RAWLIST_BASE + (u32)total * 32UL, fno.fname);
 			total++;
 		}
@@ -2632,27 +2610,24 @@ UZESID_NOINLINE static u16 LoadRootSidList(void)
 	 * SID baked into the USDC database. Append names not already present on the
 	 * card so cached-only songs remain selectable without their source .SID. */
 #if UZESID_PREBUILT_COUNT > 0
-	{
-		u8 n;
-		for(n = 0; n < (u8)UZESID_PREBUILT_COUNT && total < UZESID_RAWLIST_MAX; n++){
-			u8 k;
-			char *name = (char *)(g_uzesid_workbuf + 32u);
-			for(k = 0; k < 31u; k++){
-				name[k] = (char)pgm_read_byte(&g_prebuilt_sids[n].name[k]);
-				if(name[k] == 0)
-					break;
-			}
-			name[31] = 0;
-			SpiRamWriteStringEntry(UZESID_RAWLIST_BASE + (u32)total * 32UL, name);
-			total++;
+	u8 n;
+	for(n = 0; n < (u8)UZESID_PREBUILT_COUNT && total < UZESID_RAWLIST_MAX; n++){
+		u8 k;
+		char *name = (char *)(g_uzesid_workbuf + 32u);
+		for(k = 0; k < 31u; k++){
+			name[k] = (char)pgm_read_byte(&g_prebuilt_sids[n].name[k]);
+			if(name[k] == 0)
+				break;
 		}
+		name[31] = 0;
+		SpiRamWriteStringEntry(UZESID_RAWLIST_BASE + (u32)total * 32UL, name);
+		total++;
 	}
 #endif
 	return total;
 }
 
-UZESID_NOINLINE static u8 ReadSidMetaTitle(const char *path, char *title)
-{
+UZESID_NOINLINE static u8 ReadSidMetaTitle(const char *path, char *title){
 	u8 header[64];
 	UINT br;
 	if(pf_open(path) != FR_OK)
@@ -2664,23 +2639,20 @@ UZESID_NOINLINE static u8 ReadSidMetaTitle(const char *path, char *title)
 		return 3;
 	memcpy(title, header + 0x16, 31);
 	title[31] = 0;
-	{
-		u8 i;
-		for(i = 0; i < 32; i++){
-			u8 c = (u8)title[i];
-			if(c == 0)
-				break;
-			if(!((c >= 32 && c <= 95) || (c >= 'a' && c <= 'z')))
-				title[i] = ' ';
-		}
-		while(i != 0 && title[i - 1] == ' ')
-			title[--i] = 0;
+	u8 i;
+	for(i = 0; i < 32; i++){
+		u8 c = (u8)title[i];
+		if(c == 0)
+			break;
+		if(!((c >= 32 && c <= 95) || (c >= 'a' && c <= 'z')))
+			title[i] = ' ';
 	}
+	while(i != 0 && title[i - 1] == ' ')
+		title[--i] = 0;
 	return 0;
 }
 
-static u8 ReopenDbFile(void)
-{
+static u8 ReopenDbFile(void){
 	FRESULT res;
 
 	/* The database is opened lazily at startup.  A prebuilt filename can be
@@ -2688,7 +2660,7 @@ static u8 ReopenDbFile(void)
 	 * the full open rather than merely selecting the UZE file and poisoning
 	 * db_open with uninitialized directory state. */
 	if(!sp.lidx_ok && !sp.usdc_ok)
-		return UzeSidOpenDb();
+		return OpenDb();
 
 	res = pf_open(UZESID_ROM_FILENAME);
 	if(res != FR_OK){
@@ -2702,31 +2674,28 @@ static u8 ReopenDbFile(void)
 	return 0;
 }
 
-UZESID_NOINLINE static u8 UzeSidImportRawSid(const char *path, s16 requested_song)
-{
+UZESID_NOINLINE static u8 ImportRawSid(const char *path, s16 requested_song){
 	u32 entry_index;
+	u8 subtune_count;
+	s16 target = (requested_song < 0) ? 0 : requested_song;
 	/* Open bundled prebuilt streams before loading the PSID.  Preserve raw-SID
 	 * context so Previous/Next selects another cached subtune of the same file
 	 * instead of moving through the global cache directory. */
-	{
-		u8 subtune_count;
-		s16 target = (requested_song < 0) ? 0 : requested_song;
-		if(target >= 0 && UzeSidFindPrebuilt(path, sp.entry.md5, &subtune_count) &&
-			(u16)target < subtune_count){
-			u8 find_rc;
-			/* A browser title preview may have made a raw SID the active Petit
-			 * FatFs file while the decoded DB offsets remain cached in sp. Always
-			 * reopen UZESID.UZE before following a prebuilt-only selection. */
-			if(ReopenDbFile() == 0 && sp.usdc_ok){
-				find_rc = UzesidUsdcFindEntry(&sp.usdc, sp.entry.md5, (u16)target,
-					&sp.entry, &entry_index);
-				if(find_rc == 0){
-					number_of_songs = subtune_count;
-					current_song = target;
-					UMPrint(0, 0, PSTR("LOADING PREBUILT CACHE...     "));
-					if(UzeSidLoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_TEMP) == 0)
-						return 0;
-				}
+	if(target >= 0 && FindPrebuilt(path, sp.entry.md5, &subtune_count) &&
+		(u16)target < subtune_count){
+		u8 find_rc;
+		/* A browser title preview may have made a raw SID the active Petit
+		 * FatFs file while the decoded DB offsets remain cached in sp. Always
+		 * reopen UZESID.UZE before following a prebuilt-only selection. */
+		if(ReopenDbFile() == 0 && sp.usdc_ok){
+			find_rc = UzesidUsdcFindEntry(&sp.usdc, sp.entry.md5, (u16)target,
+				&sp.entry, &entry_index);
+			if(find_rc == 0){
+				number_of_songs = subtune_count;
+				current_song = target;
+				UMPrint(0, 0, PSTR("LOADING PREBUILT CACHE...     "));
+				if(LoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_TEMP) == 0)
+					return 0;
 			}
 		}
 	}
@@ -2740,7 +2709,7 @@ UZESID_NOINLINE static u8 UzeSidImportRawSid(const char *path, s16 requested_son
 	/* Open the database headers before the SID.  Hash when an existing stream
 	 * could match or when writeback is enabled, since the MD5/subtune pair is
 	 * the persistent cache key. */
-	if(UzeSidEnsureDbOpen() == 0 && sp.usdc_ok && sp.usdc.header.live_entries != 0u)
+	if(EnsureDbOpen() == 0 && sp.usdc_ok && sp.usdc.header.live_entries != 0u)
 		need_md5 = 1;
 #if UZESID_ENABLE_CACHE_WRITE
 	need_md5 = 1;
@@ -2748,7 +2717,7 @@ UZESID_NOINLINE static u8 UzeSidImportRawSid(const char *path, s16 requested_son
 
 	/* Reuse sp.entry as the 128-byte PSID header/read scratch instead of
 	 * reserving that buffer on the AVR stack. */
-	UzeSidLoadProgress(0);
+	LoadProgress(0);
 	if(!LoadPSIDFilePff(path, need_md5 ? sp.entry.md5 : 0, &sp.entry, requested_song)){
 		if(g_uzesid_psid_error == UZESID_PSID_ERROR_TOO_LARGE)
 			return 3;
@@ -2760,24 +2729,23 @@ UZESID_NOINLINE static u8 UzeSidImportRawSid(const char *path, s16 requested_son
 		memset(sp.entry.md5, 0, sizeof(sp.entry.md5));
 
 	if(need_md5){
-		UzeSidLoadProgress(4);
+		LoadProgress(4);
 		/* Hashing reopens the SID. Petit FatFs has one active file, so reopen
 		 * UZESID.UZE before using its decoded directory offsets. */
 		if(ReopenDbFile() == 0 && sp.usdc_ok){
 			rc = UzesidUsdcFindEntry(&sp.usdc, sp.entry.md5, (u16)current_song, &sp.entry, &entry_index);
-			if(rc == 0 && UzeSidLoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_TEMP) == 0)
+			if(rc == 0 && LoadEntryDirect(entry_index, &sp.entry, UZESID_SRC_TEMP) == 0)
 				return 0;
 		}
 	}
 
 	/* No persistent cache entry exists. Pre-emulate once into the second
 	 * SPI-RAM bank, then use the lightweight register-stream player. */
-	rc = UzeSidLoadTempCurrent();
+	rc = LoadTempCurrent();
 	return (rc == 0) ? 0 : 2;
 }
 
-UZESID_NOINLINE static void RawSidSelectWindow(void)
-{
+UZESID_NOINLINE static void RawSidSelectWindow(void){
 	u16 total = LoadRootSidList();
 	u16 foff = 0;
 	u16 last_ord = 0xFFFFu;
@@ -2805,32 +2773,30 @@ UZESID_NOINLINE static void RawSidSelectWindow(void)
 		UMPrint(18, SCREEN_TILES_V - 1, PSTR("of"));
 		SetTile(26, 2, TILE_WIN_SCRU);
 		SetTile(26, SCREEN_TILES_V - 1, TILE_WIN_SCRD);
-		{
-			u16 cur_ord = 0xFFFFu;
-			for(i = 0; i < UZESID_LIST_ROWS; i++){
-				u16 ord = (u16)(foff + i);
-				if(ord >= total) break;
-				SpiRamReadStringEntry(UZESID_RAWLIST_BASE + (u32)ord * 32UL, name);
-				UMPrintRamClip(5, 4 + i, name, UZESID_BROWSER_LIST_WIDTH);
-				if(line == i + 4){
-					u8 k;
-					cur_ord = ord;
-					for(k = 5; k < 26; k++) vram[(line * VRAM_TILES_H) + k] += 64;
-				}
+		u16 cur_ord = 0xFFFFu;
+		for(i = 0; i < UZESID_LIST_ROWS; i++){
+			u16 ord = (u16)(foff + i);
+			if(ord >= total) break;
+			SpiRamReadStringEntry(UZESID_RAWLIST_BASE + (u32)ord * 32UL, name);
+			UMPrintRamClip(5, 4 + i, name, UZESID_BROWSER_LIST_WIDTH);
+			if(line == i + 4){
+				u8 k;
+				cur_ord = ord;
+				for(k = 5; k < 26; k++) vram[(line * VRAM_TILES_H) + k] += 64;
 			}
-			if(cur_ord != last_ord){
-				last_ord = cur_ord;
-				UMPrint(0, 0, PSTR("Title:                         "));
-				UMPrint(0, 1, PSTR("                              "));
-				UMPrint(0, 2, PSTR("                              "));
-				if(cur_ord != 0xFFFFu){
-					SpiRamReadStringEntry(UZESID_RAWLIST_BASE + (u32)cur_ord * 32UL, name);
-					if(ReadSidMetaTitle(name, sp.entry.title) == 0)
-						UMPrintRamClip(7, 0, sp.entry.title, UZESID_BROWSER_PREVIEW_WIDTH);
-					else
-						UMPrintRamClip(7, 0, name, UZESID_BROWSER_PREVIEW_WIDTH);
-				}
-			}
+		}
+		if(cur_ord != last_ord){
+			last_ord = cur_ord;
+			UMPrint(0, 0, PSTR("Title:                         "));
+			UMPrint(0, 1, PSTR("                              "));
+			UMPrint(0, 2, PSTR("                              "));
+			if(cur_ord != 0xFFFFu){
+				SpiRamReadStringEntry(UZESID_RAWLIST_BASE + (u32)cur_ord * 32UL, name);
+				if(ReadSidMetaTitle(name, sp.entry.title) == 0)
+					UMPrintRamClip(7, 0, sp.entry.title, UZESID_BROWSER_PREVIEW_WIDTH);
+				else
+					UMPrintRamClip(7, 0, name, UZESID_BROWSER_PREVIEW_WIDTH);
+		}
 		}
 		if(import_error == 1)
 			UMPrint(0, 1, PSTR("SID LOAD FAILED               "));
@@ -2854,7 +2820,7 @@ UZESID_NOINLINE static void RawSidSelectWindow(void)
 					SpiRamWriteStringEntry(UZESID_SELECTED_PATH_OFS, name);
 					UMPrint(0, 1, PSTR("Loading SID...                "));
 					WaitVsync(1);
-					import_error = UzeSidImportRawSid(name, -1);
+					import_error = ImportRawSid(name, -1);
 					if(import_error == 0) break;
 				}
 			}
