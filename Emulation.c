@@ -2205,9 +2205,6 @@ typedef struct {
 
 static inline u32 md5_rotl(u32 x, u32 s){ return (x << s) | (x >> (32u - s)); }
 
-/* AVR cannot address ordinary const tables in flash with normal loads.  Keep
- * the 320-byte MD5 tables explicitly in PROGMEM; otherwise they consume scarce
- * SRAM and leave too little stack for hashing plus the video interrupt. */
 static const u32 md5_k[64] PROGMEM = {
 	0xd76aa478u,0xe8c7b756u,0x242070dbu,0xc1bdceeeu,0xf57c0fafu,0x4787c62au,0xa8304613u,0xfd469501u,
 	0x698098d8u,0x8b44f7afu,0xffff5bb1u,0x895cd7beu,0x6b901122u,0xfd987193u,0xa679438eu,0x49b40821u,
