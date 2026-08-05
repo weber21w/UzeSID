@@ -1755,7 +1755,7 @@ static u8 UzeSidLoadTempCurrent(void)
 			 * silence, so a newly captured song cannot start and stutter while
 			 * the SD card is still being updated. */
 			SilenceBuffer();
-			UMPrint(0, 0, PSTR("SAVING CACHE        %           "));
+			UMPrint(0, 0, PSTR("SAVING CACHE      %             "));
 			while(SP_SAVE_STATE != UZESID_SAVE_IDLE){
 				u8 percent;
 				UzeSidCacheSavePump();
@@ -1765,7 +1765,7 @@ static u8 UzeSidLoadTempCurrent(void)
 					percent = 100u;
 				if(percent != shown){
 					shown = percent;
-					PrintByte(17, 0, percent, 0);
+					PrintByte(15, 0, percent, 0);
 					WaitVsync(1);
 				}
 			}
@@ -2168,7 +2168,6 @@ int main(void)
 		res = pf_mount(&fs);
 		if(res == FR_OK){
 			UMPrint(3, 2, PSTR("Mounted SD Card"));
-			while(rcv_spi() != 0xFF);
 			break;
 		}
 		WaitVsync(30);
@@ -2179,6 +2178,10 @@ int main(void)
 		goto MAIN_FAIL;
 	}
 
+	/* Match the known-good UzeMOD hardware sequence: do not clock the shared
+	 * SPI bus before SpiRamInitGetSize() has configured PA4 as the RAM CS.
+	 * Keep the SD card explicitly deselected while the RAM probe runs. */
+	SD_DESELECT();
 	bank_count = SpiRamInitGetSize();
 	if(!bank_count){
 		UMPrint(3, 3, PSTR("ERROR: No SPI RAM"));
